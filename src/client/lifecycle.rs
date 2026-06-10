@@ -201,6 +201,7 @@ impl Client {
             prekey_upload_lock: Arc::new(async_lock::Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
+            offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             history_sync_tasks_in_flight: Arc::new(AtomicUsize::new(0)),
             history_sync_idle_notifier: Arc::new(event_listener::Event::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
@@ -378,6 +379,7 @@ impl Client {
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.outbound_flush.reopen();
 
@@ -488,6 +490,15 @@ impl Client {
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
 
+        // Drain buffered offline receipts into the flush window before
+        // closing it, so a disconnect mid-offline-sync still acks the
+        // already-processed backlog (issue #571 semantics). close() only stops
+        // outbound task spawns, not buffering, so a message still in flight can
+        // re-buffer after this drain; those entries are dropped by the
+        // connection-state reset (clear_offline_receipt_buffer) and the server
+        // redelivers their messages on the next connect, where they are
+        // re-acked fresh.
+        self.flush_offline_receipts();
         // Prevent late receipt producers from escaping the drain window.
         self.outbound_flush.close();
         self.outbound_flush
@@ -537,6 +548,7 @@ impl Client {
         self.auto_reconnect_errors
             .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
 
+        self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -561,6 +573,7 @@ impl Client {
         info!("Reconnecting immediately (expected disconnect).");
         self.expected_disconnect.store(true, Ordering::Relaxed);
 
+        self.flush_offline_receipts();
         self.outbound_flush.close();
         self.outbound_flush
             .flush(&*self.runtime, std::time::Duration::from_secs(2))
@@ -641,6 +654,7 @@ impl Client {
         self.pending_device_sync.clear().await;
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
+        self.clear_offline_receipt_buffer();
         self.offline_batch.reset();
         self.offline_sync_metrics
             .active
