@@ -173,7 +173,7 @@ const TRANSPORT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Snapshot of internal collection sizes for memory leak detection.
 ///
-/// All counts are approximate (moka caches may have pending evictions).
+/// All counts are approximate (caches may have pending evictions).
 /// Call [`Client::memory_diagnostics`] to obtain a snapshot.
 ///
 /// Requires the `debug-diagnostics` feature.
@@ -191,7 +191,7 @@ pub struct MemoryDiagnostics {
     pub undecryptable_dispatched: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
-    // -- Moka caches (capacity-only, no TTL) --
+    // -- Capacity-only caches (no TTL) --
     pub session_locks: u64,
     pub chat_lanes: u64,
     // -- Unbounded collections --
@@ -213,7 +213,7 @@ pub struct MemoryDiagnostics {
 impl std::fmt::Display for MemoryDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Memory Diagnostics ===")?;
-        writeln!(f, "--- Moka caches (TTL-bounded) ---")?;
+        writeln!(f, "--- TTL-bounded caches ---")?;
         writeln!(f, "  group_cache:            {}", self.group_cache)?;
         writeln!(
             f,
@@ -236,7 +236,7 @@ impl std::fmt::Display for MemoryDiagnostics {
         )?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
-        writeln!(f, "--- Moka caches (capacity-only) ---")?;
+        writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(f, "--- Unbounded collections ---")?;
@@ -426,7 +426,7 @@ pub struct Client {
     pub(crate) connection_generation: Arc<AtomicU64>,
 
     /// Cache for recent messages (serialized bytes) for retry functionality.
-    /// Uses moka cache with TTL and max capacity for automatic eviction.
+    /// Uses an in-process cache with TTL and max capacity for automatic eviction.
     pub(crate) recent_messages: Cache<ChatMessageId, Arc<Vec<u8>>>,
 
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
@@ -438,7 +438,7 @@ pub struct Client {
     /// Track retry attempts per message to prevent infinite retry loops.
     /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
     /// recent `RetryReason` we attached, fused so the decrypt-failure path
-    /// does one cache write and the binary carries one moka instantiation
+    /// does one cache write and the binary carries one cache instantiation
     /// instead of two. The reason is `None` when the count was learned from
     /// the sender's echoed stanza `count` attribute rather than a local
     /// decrypt failure; diagnostics and regression tests read it to tell
