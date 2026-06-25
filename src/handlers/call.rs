@@ -790,4 +790,78 @@ mod tests {
             "a <terminate reason=\"timeout\"> on a ringing call must surface a MissedCall"
         );
     }
+
+    // A call we locally declined must not later be recorded as missed: reject() consumes the ringing
+    // flag, so a caller <terminate> that follows our <reject> reads as ended, not missed.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn local_reject_then_caller_terminate_is_not_missed() {
+        use async_trait::async_trait;
+        use bytes::Bytes;
+        use wacore::handshake::NoiseCipher;
+
+        struct OkTransport;
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::transport::Transport for OkTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+
+        let client = make_client().await;
+        // reject()/offer-ack need a socket to send through.
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(OkTransport) as Arc<dyn crate::transport::Transport>,
+            NoiseCipher::new(&key).expect("valid key"),
+            NoiseCipher::new(&key).expect("valid key"),
+        );
+        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let mut cancelled = false;
+        // The offer rings.
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&offer_stanza()),
+                    &mut cancelled
+                )
+                .await
+        );
+
+        // We decline it.
+        let owned = node_to_owned_ref(&offer_stanza());
+        let incoming = parse_call_stanza(owned.get())
+            .expect("offer parses")
+            .expect("offer is a recognized call");
+        client
+            .voip()
+            .reject(&incoming)
+            .await
+            .expect("reject sends the <reject>");
+
+        // The caller then terminates; the declined call must not surface a missed call.
+        let terminate = terminate_stanza(fake_caller_lid(), fake_caller_lid(), "CALL-ID-0001");
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&terminate),
+                    &mut cancelled
+                )
+                .await
+        );
+        assert_eq!(
+            count_missed(&rx, "CALL-ID-0001"),
+            0,
+            "a locally-declined call must not be recorded as a missed call"
+        );
+    }
 }
