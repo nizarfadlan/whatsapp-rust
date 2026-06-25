@@ -120,8 +120,9 @@ pub struct CallConfig {
     pub enable_sframe: bool,
 }
 
-// Manual Debug so a stray `{:?}` can't leak the SRTP callKey or the STUN integrity key, matching the
-// redaction the sibling key structs already apply (E2eSrtpKeys, SrtpKeyingMaterial).
+// Manual Debug so a stray `{:?}` can't leak the SRTP callKey, the STUN integrity key, or the relay
+// token (all live call credentials), matching the redaction the sibling key structs already apply
+// (E2eSrtpKeys, SrtpKeyingMaterial).
 impl core::fmt::Debug for CallConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CallConfig")
@@ -132,7 +133,7 @@ impl core::fmt::Debug for CallConfig {
             .field("call_key", &"[redacted]")
             .field("ssrc", &self.ssrc)
             .field("samples_per_packet", &self.samples_per_packet)
-            .field("relay_token", &self.relay_token)
+            .field("relay_token", &"[redacted]")
             .field("relay_ip", &self.relay_ip)
             .field("relay_port", &self.relay_port)
             .field("integrity_key", &"[redacted]")
@@ -771,9 +772,15 @@ mod tests {
             dbg.contains("integrity_key: \"[redacted]\""),
             "integrity_key not redacted"
         );
-        // The 0..32 callKey bytes and the b"relay-key" integrity-key bytes must not appear.
+        assert!(
+            dbg.contains("relay_token: \"[redacted]\""),
+            "relay_token not redacted"
+        );
+        // The 0..32 callKey bytes, the b"relay-key" integrity key, and the 0xAB relay-token bytes
+        // must not appear.
         assert!(!dbg.contains("[0, 1, 2, 3"), "callKey bytes leaked");
         assert!(!dbg.contains("114, 101, 108"), "integrity_key bytes leaked");
+        assert!(!dbg.contains("[171, 171"), "relay_token bytes leaked");
         // Non-secret fields stay visible for diagnostics.
         assert!(dbg.contains("call_id: \"CID\""));
     }
