@@ -113,6 +113,33 @@ impl<'a> FieldWalker<'a> {
         self.reader.total_out()
     }
 
+    /// Decompressed bytes already handed to the parser, INCLUDING the field
+    /// most recently yielded by `next_field` (its bytes stay buffered until
+    /// the next call, but the caller has already processed them). Excludes
+    /// only the tail beyond it, so a density observed over this prefix is
+    /// neither diluted by inflater read-ahead nor inflated by dropping the
+    /// very conversation whose records were just counted: on a blob whose
+    /// first conversation alone reaches the sample threshold, the old
+    /// exclusive form left a near-zero denominator and the estimate clamped.
+    fn parsed_bytes(&self) -> u64 {
+        let unparsed_tail = self.reader.available().len().saturating_sub(self.pending);
+        self.reader.total_out().saturating_sub(unparsed_tail as u64)
+    }
+
+    /// Total decompressed size extrapolated from the zlib ratio observed so
+    /// far; exact once the stream has fully inflated.
+    fn estimated_total_out(&self) -> u64 {
+        let (in_pos, in_len) = self.reader.compressed_progress();
+        if in_pos == 0 {
+            return self.reader.total_out();
+        }
+        self.reader
+            .total_out()
+            .saturating_mul(in_len as u64)
+            .checked_div(in_pos as u64)
+            .unwrap_or(0)
+    }
+
     /// Re-borrow the payload of the field most recently yielded by
     /// [`FieldWalker::next_field`] (it stays buffered until the next call).
     fn pending_payload(&self, payload_start: usize) -> &[u8] {
@@ -242,13 +269,29 @@ fn process_history_sync_streaming(
         nct_salt: None,
         conversations_processed: 0,
         tc_token_candidates: Vec::new(),
-        // Grown on demand: a full pre-count pass scanned the whole blob just to
-        // size a Vec that only holds the secret-record subset (it over-allocated
-        // and cost ~2.5% of the decode); plain growth is cheaper here.
+        // Starts empty and gets a one-shot density-based reserve once the
+        // walk has seen RESERVE_SAMPLE_RECORDS (see below). A full pre-count
+        // pass was tried before: it scanned the whole blob just to size a Vec
+        // holding only the secret-record subset (over-allocating, ~2.5% of
+        // the decode).
         msg_secret_records: Vec::new(),
         compressed_bytes: None,
         decompressed_size: 0,
     };
+
+    // One-shot capacity extrapolation for the secret-record accumulator. A
+    // full pre-count pass (see the field comment above) was measured at ~2.5%
+    // of the decode, so instead the record density observed over a prefix is
+    // scaled to the blob's extrapolated decompressed size. Costs O(1), adapts
+    // to blobs with few secrets, and an off estimate just falls back to
+    // doubling. Extrapolating from the first conversation alone overshot to
+    // the clamp on measured blobs (doubling the transient peak), so the
+    // sample must first reach RESERVE_SAMPLE_RECORDS; the doubling ladder up
+    // to that point copies only ~2x its own bytes, which is noise. The clamp
+    // bounds over-allocation to ~2 MB.
+    const RESERVE_SAMPLE_RECORDS: usize = 128;
+    const RECORD_RESERVE_CAP: usize = 16384;
+    let mut density_reserved = false;
 
     while let Some(field) = walker.next_field()? {
         if field.wire_type != wire_type::LENGTH_DELIMITED {
@@ -263,6 +306,19 @@ fn process_history_sync_streaming(
                     extract_conversation_fields(value, &mut result.msg_secret_records)
                 {
                     result.tc_token_candidates.push(candidate);
+                }
+                if !density_reserved && result.msg_secret_records.len() >= RESERVE_SAMPLE_RECORDS {
+                    density_reserved = true;
+                    // max(1) makes the division safe; parsed_bytes is only 0
+                    // if nothing decompressed yet, impossible past a record.
+                    let parsed = walker.parsed_bytes().max(1);
+                    let records = result.msg_secret_records.len();
+                    let estimated = ((records as u64).saturating_mul(walker.estimated_total_out())
+                        / parsed) as usize;
+                    let estimated = estimated.min(RECORD_RESERVE_CAP);
+                    result
+                        .msg_secret_records
+                        .reserve(estimated.saturating_sub(records));
                 }
             }
             // pushnames (repeated) — only our own is needed
@@ -2291,6 +2347,65 @@ mod tests {
         process_history_sync(compressed, None, false)
             .unwrap()
             .msg_secret_records
+    }
+
+    /// The density reserve must not clamp when a SINGLE conversation reaches
+    /// the sample threshold: parsed_bytes includes the pending (just yielded)
+    /// field, so the denominator covers the conversation whose records were
+    /// counted. With the exclusive form the denominator was ~0 and the
+    /// estimate hit RECORD_RESERVE_CAP, over-reserving ~2 MB.
+    #[test]
+    fn test_reserve_single_big_conversation_does_not_clamp() {
+        let chat = "5511777776666@s.whatsapp.net";
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        let total_msgs = 200usize;
+        for i in 0..total_msgs {
+            let wm = wa::WebMessageInfo {
+                key: wa::MessageKey {
+                    from_me: Some(false),
+                    id: Some(format!("MSG{i:04}")),
+                    ..Default::default()
+                },
+                // Varied payload so zlib does not flatten the blob to nothing.
+                message_secret: Some(vec![(i % 251) as u8; 32]),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mut history_msg = Vec::new();
+            emit_len_field(&mut history_msg, tags::history_sync_msg::MESSAGE, &wm);
+            emit_len_field(&mut conv, tags::conversation::MESSAGES, &history_msg);
+        }
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::CONVERSATIONS, &conv);
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let records = process_history_sync(compressed, None, false)
+            .unwrap()
+            .msg_secret_records;
+        assert_eq!(records.len(), total_msgs);
+        assert!(
+            records.capacity() < 2048,
+            "estimate should track the real count (~{total_msgs}), got capacity {}",
+            records.capacity()
+        );
+    }
+
+    /// The zlib-ratio extrapolation is exact once the stream fully inflates.
+    #[test]
+    fn test_estimated_total_out_exact_after_drain() {
+        let mut hs = Vec::new();
+        emit_len_field(&mut hs, tags::history_sync::PUSHNAMES, b"\x0a\x03abc");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&hs).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut walker = FieldWalker::new(&compressed, MAX_DECOMPRESSED);
+        while walker.next_field().unwrap().is_some() {}
+        assert_eq!(walker.estimated_total_out(), walker.total_out());
+        assert_eq!(walker.total_out(), hs.len() as u64);
     }
 
     /// A (malformed) conversation that carries messages BEFORE its id must not
