@@ -1,6 +1,21 @@
 use super::*;
 
 impl Client {
+    /// Whether `jid` is our own account (PN or LID). The privacy-token paths
+    /// never attach to or issue for ourselves; a single source of truth keeps
+    /// the message and call paths from drifting apart.
+    fn is_own_jid(&self, jid: &Jid) -> bool {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        snapshot
+            .pn
+            .as_ref()
+            .is_some_and(|pn| pn.is_same_user_as(jid))
+            || snapshot
+                .lid
+                .as_ref()
+                .is_some_and(|lid| lid.is_same_user_as(jid))
+    }
+
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
     ///
     /// Follows WA Web's fallback chain (MsgCreateFanoutStanza.js `Re = R(te) ?? D(te, s)`):
@@ -26,16 +41,7 @@ impl Client {
         };
 
         // Skip for own JID — no need to send a privacy token to ourselves.
-        let snapshot = self.persistence_manager.get_device_snapshot();
-        let is_self = snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(to))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(to));
-        if is_self {
+        if self.is_own_jid(to) {
             return false;
         }
 
@@ -79,6 +85,7 @@ impl Client {
             .then_some(entry.token.as_slice())
         });
         // cstoken needs both the NCT salt and a resolved account LID (WA Web `D`).
+        let snapshot = self.persistence_manager.get_device_snapshot();
         let cs_token_inputs: Option<(&[u8], &wacore_binary::CompactString)> =
             match (&snapshot.nct_salt, &resolved_lid) {
                 (Some(salt), Some(lid)) => Some((salt.as_slice(), lid)),
@@ -120,7 +127,7 @@ impl Client {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.issue_tc_token", level = "debug", skip_all, fields(to = %to.observe())))]
-    pub(super) async fn issue_tc_token_after_send(&self, to: &Jid) {
+    pub(crate) async fn issue_tc_token_after_send(&self, to: &Jid) {
         use wacore::iq::tctoken::IssuePrivacyTokensSpec;
 
         // Bots and status broadcast don't participate in the privacy token system.
@@ -142,6 +149,35 @@ impl Client {
             return;
         }
         self.record_tc_token_sender_timestamp(to).await;
+    }
+
+    /// Whether a fresh tctoken should be issued to `to`, rate-limited by the
+    /// sender bucket. Independent of the 1:1 message AB props — WA Web schedules
+    /// `sendTcToken` on its own cadence (`MsgJob`, `StartCall`) regardless of
+    /// whether a token was attached to the outgoing stanza.
+    #[cfg(feature = "voip")]
+    pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
+        use wacore::iq::tctoken::should_send_new_tc_token_with;
+
+        // A self-call must never issue or record a token for our own account.
+        if self.is_own_jid(to) {
+            return false;
+        }
+
+        if to.is_bot() || to.is_status_broadcast() {
+            return false;
+        }
+
+        let key = self.resolve_tc_token_key(to).await;
+        let sender_ts = match self.persistence_manager.backend().get_tc_token(&key).await {
+            Ok(entry) => entry.and_then(|e| e.sender_timestamp),
+            Err(e) => {
+                log::warn!(target: "Client/TcToken", "Failed to read tc_token for {}: {e}", to.observe());
+                None
+            }
+        };
+
+        should_send_new_tc_token_with(sender_ts, &self.tc_token_config().await)
     }
 
     /// Persist tokens returned by the explicit `tc_token().issue_tokens()` API.
@@ -423,6 +459,60 @@ mod tests {
         assert!(
             entry.sender_timestamp.is_some(),
             "sender_timestamp is advanced on issuance"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_true_for_unknown_contact() {
+        let client = create_test_client().await;
+        let jid = Jid::new("770000003", Server::Lid);
+        assert!(
+            client.should_issue_tc_token(&jid).await,
+            "a contact with no recorded issuance should get a token"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_false_within_sender_bucket() {
+        let client = create_test_client().await;
+        client
+            .persistence_manager
+            .backend()
+            .put_tc_token(
+                "770000004",
+                &TcTokenEntry {
+                    token: Vec::new(),
+                    token_timestamp: 0,
+                    sender_timestamp: Some(wacore::time::now_secs()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let jid = Jid::new("770000004", Server::Lid);
+        assert!(
+            !client.should_issue_tc_token(&jid).await,
+            "a fresh issuance in the current bucket must not re-issue"
+        );
+    }
+
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn should_issue_tc_token_false_for_self() {
+        let client = create_test_client().await;
+        let own = Jid::new("999000111", Server::Lid);
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                own.clone(),
+            )))
+            .await;
+
+        assert!(
+            !client.should_issue_tc_token(&own).await,
+            "a self-call must never issue a tc token for our own account"
         );
     }
 }
