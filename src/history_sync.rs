@@ -407,24 +407,9 @@ impl Client {
 
         let backend = self.persistence_manager.backend();
 
-        // Serialize the get-then-store below: history-sync chunks ingest
-        // concurrently, so without this two same-contact candidates could
-        // read the same baseline and the older one's unconditional write could
-        // land last, clobbering a fresher privacy token.
-        let _guard = self.tc_token_lock.lock().await;
-
-        // Skip only when an existing *real* token is newer than this candidate; a
-        // byte-less placeholder stamps token_timestamp with a sender epoch and
-        // must never block the first real token from history sync.
-        if let Ok(Some(existing)) = backend.get_tc_token(token_key).await
-            && !existing.token.is_empty()
-            && (existing.token_timestamp as u64) > candidate.tc_token_timestamp
-        {
-            return;
-        }
-
-        // Two atomic upserts — token fields, then the sender bucket (advance-only)
-        // — so a concurrent post-send issuance is never clobbered by this write.
+        // Newer-wins lives in the store now (atomic, lock-free), so concurrent
+        // history-sync chunks and the privacy path converge without a
+        // get-then-store or a lock.
         if let Err(e) = backend
             .store_received_tc_token(
                 token_key,

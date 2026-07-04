@@ -3004,40 +3004,55 @@ impl ProtocolStore for SqliteStore {
         token: &[u8],
         token_timestamp: i64,
     ) -> Result<()> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
         let token = token.to_vec();
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // On conflict update only the token fields so a sender_timestamp
-            // written concurrently by the issuance path survives.
-            diesel::insert_into(tc_tokens::table)
-                .values((
-                    tc_tokens::jid.eq(&jid),
-                    tc_tokens::token.eq(&token),
-                    tc_tokens::token_timestamp.eq(token_timestamp),
-                    tc_tokens::sender_timestamp.eq(None::<i64>),
-                    tc_tokens::device_id.eq(device_id),
-                    tc_tokens::updated_at.eq(now),
-                ))
-                .on_conflict((tc_tokens::jid, tc_tokens::device_id))
-                .do_update()
-                .set((
-                    tc_tokens::token.eq(&token),
-                    tc_tokens::token_timestamp.eq(token_timestamp),
-                    tc_tokens::updated_at.eq(now),
-                ))
-                .execute(&mut conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(())
+        // IMMEDIATE so the read + conditional write is atomic against concurrent
+        // writers (WAL + busy_timeout serialize them): this is the lock-free
+        // newer-wins that lets history-sync and the privacy path converge without
+        // clobbering a fresher token. with_retry rides out transient SQLITE_BUSY.
+        self.with_retry("store_received_tc_token", || {
+            let jid = jid.clone();
+            let token = token.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| -> QueryResult<()> {
+                    let existing: Option<(Vec<u8>, i64)> = tc_tokens::table
+                        .filter(tc_tokens::jid.eq(&jid))
+                        .filter(tc_tokens::device_id.eq(device_id))
+                        .select((tc_tokens::token, tc_tokens::token_timestamp))
+                        .first(conn)
+                        .optional()?;
+                    let write = match &existing {
+                        Some((existing_token, existing_ts)) => {
+                            existing_token.is_empty() || token_timestamp >= *existing_ts
+                        }
+                        None => true,
+                    };
+                    if write {
+                        diesel::insert_into(tc_tokens::table)
+                            .values((
+                                tc_tokens::jid.eq(&jid),
+                                tc_tokens::token.eq(&token),
+                                tc_tokens::token_timestamp.eq(token_timestamp),
+                                tc_tokens::sender_timestamp.eq(None::<i64>),
+                                tc_tokens::device_id.eq(device_id),
+                                tc_tokens::updated_at.eq(now),
+                            ))
+                            .on_conflict((tc_tokens::jid, tc_tokens::device_id))
+                            .do_update()
+                            .set((
+                                tc_tokens::token.eq(&token),
+                                tc_tokens::token_timestamp.eq(token_timestamp),
+                                tc_tokens::updated_at.eq(now),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))??;
-        Ok(())
     }
 
     async fn touch_tc_token_sender_timestamp(
@@ -4270,6 +4285,51 @@ mod tests {
             .unwrap();
         let c = store.get_tc_token("user@lid").await.unwrap().unwrap();
         assert_eq!(c.sender_timestamp, Some(6000), "touch is advance-only");
+    }
+
+    #[tokio::test]
+    async fn store_received_tc_token_is_newer_wins() {
+        let store = create_test_store().await;
+
+        // First real token at t=5000.
+        store
+            .store_received_tc_token("c@lid", &[1, 1, 1], 5000)
+            .await
+            .unwrap();
+
+        // A stale write (older timestamp) must not clobber the fresher token —
+        // this is the atomic newer-wins that replaces the tc_token_lock.
+        store
+            .store_received_tc_token("c@lid", &[2, 2, 2], 3000)
+            .await
+            .unwrap();
+        let e = store.get_tc_token("c@lid").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![1, 1, 1], "older write must not overwrite");
+        assert_eq!(e.token_timestamp, 5000);
+
+        // A newer write wins.
+        store
+            .store_received_tc_token("c@lid", &[3, 3, 3], 7000)
+            .await
+            .unwrap();
+        let e = store.get_tc_token("c@lid").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![3, 3, 3]);
+        assert_eq!(e.token_timestamp, 7000);
+
+        // A byte-less placeholder never blocks the first real token, even when
+        // that token's timestamp is older than the placeholder's sender epoch.
+        store
+            .touch_tc_token_sender_timestamp("p@lid", 9000)
+            .await
+            .unwrap();
+        store
+            .store_received_tc_token("p@lid", &[4, 4, 4], 6000)
+            .await
+            .unwrap();
+        let e = store.get_tc_token("p@lid").await.unwrap().unwrap();
+        assert_eq!(e.token, vec![4, 4, 4], "placeholder must accept real token");
+        assert_eq!(e.token_timestamp, 6000);
+        assert_eq!(e.sender_timestamp, Some(9000), "sender bucket preserved");
     }
 
     #[tokio::test]
