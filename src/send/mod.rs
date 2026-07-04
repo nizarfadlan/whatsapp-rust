@@ -736,18 +736,26 @@ impl Client {
             }
         }
 
+        use futures::StreamExt;
         use std::collections::HashMap;
-        let mut resolved: Vec<Option<Jid>> = Vec::with_capacity(recipients.len());
+        // Resolve recipient LIDs concurrently (a status audience can be hundreds of
+        // contacts, each a cold-cache DB read). Stream over indices and rebuild
+        // `resolved` in order — assemble_status_participants is position-sensitive.
+        let resolved_indexed: Vec<(usize, Option<Jid>)> =
+            futures::stream::iter(0..recipients.len())
+                .map(|i| async move { (i, self.resolve_recipient_to_lid(&recipients[i]).await) })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+        let mut resolved: Vec<Option<Jid>> = vec![None; recipients.len()];
         let mut lid_to_pn_map: HashMap<wacore_binary::CompactString, Jid> =
             HashMap::with_capacity(recipients.len() + 1);
-        for jid in recipients {
-            if let Some(lid_jid) = self.resolve_recipient_to_lid(jid).await {
-                if jid.is_pn() {
-                    lid_to_pn_map.insert(lid_jid.user.clone(), jid.to_non_ad());
+        for (i, lid) in resolved_indexed {
+            if let Some(lid_jid) = lid {
+                if recipients[i].is_pn() {
+                    lid_to_pn_map.insert(lid_jid.user.clone(), recipients[i].to_non_ad());
                 }
-                resolved.push(Some(lid_jid));
-            } else {
-                resolved.push(None);
+                resolved[i] = Some(lid_jid);
             }
         }
         lid_to_pn_map.insert(own_lid.user.clone(), own_jid.to_non_ad());

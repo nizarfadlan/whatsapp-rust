@@ -7,6 +7,13 @@ pub use wacore::download::{
     DownloadUtils, Downloadable, MediaDecryption, MediaDecryptionError, MediaType,
 };
 
+/// Cap on the speculative capacity pre-allocated for the in-memory download
+/// buffer. Sized to the plaintext length the message declares, but a bogus
+/// length must not drive a multi-GB allocation before a single byte arrives;
+/// beyond this the buffer grows on demand. Comfortably above typical
+/// image/video/audio media so the common case is a single allocation.
+const DOWNLOAD_PREALLOC_CAP: u64 = 64 * 1024 * 1024;
+
 impl From<&MediaConn> for wacore::download::MediaConnection {
     fn from(conn: &MediaConn) -> Self {
         wacore::download::MediaConnection {
@@ -116,6 +123,11 @@ impl DownloadRequestError {
     }
 }
 
+/// Auth-refresh + host-failover retry loop that returns the decrypted bytes.
+/// Unlike [`download_to_writer_with_retry`] each attempt gets a FRESH buffer
+/// (the executor allocates its own), so a failed host that wrote a longer body
+/// (e.g. a CDN error page that decrypts to more bytes before its MAC fails)
+/// can't leave a stale tail behind a shorter successful retry.
 async fn download_media_with_retry<
     PrepareRequests,
     PrepareRequestsFut,
@@ -150,7 +162,6 @@ where
                 Ok(data) => return Ok(data),
                 Err(err) if (err.is_auth() || err.is_not_found()) && attempt == 0 => {
                     // Auth error or 404/410 (expired URL): refresh media conn and re-derive URLs.
-                    // Matches WA Web's MediaNotFoundError → forceRefresh flow.
                     invalidate_media_conn().await;
                     force_refresh = true;
                     retry_with_fresh_auth = true;
@@ -259,10 +270,28 @@ impl Client {
         tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
     )]
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
+        // Stream each attempt into a FRESH in-memory buffer: the CDN read and the
+        // AES/HMAC decrypt interleave in one blocking pass (overlapping network
+        // with CPU, ~halving peak memory vs. fetch-whole-then-decrypt), and a new
+        // buffer per attempt means a failed host that wrote a longer body can't
+        // leave a stale tail behind a shorter successful retry. Pre-size to the
+        // declared plaintext length, capped so a bogus length can't drive a huge
+        // speculative allocation.
+        let cap = downloadable
+            .file_length()
+            .unwrap_or(0)
+            .min(DOWNLOAD_PREALLOC_CAP) as usize;
         download_media_with_retry(
             |force| self.prepare_requests(downloadable, force),
             || async { self.invalidate_media_conn().await },
-            |request| async move { self.download_with_request(&request).await },
+            |request| async move {
+                let writer = std::io::Cursor::new(Vec::with_capacity(cap));
+                match self.streaming_download_and_decrypt(&request, writer).await {
+                    Ok((writer, Ok(()))) => Ok(writer.into_inner()),
+                    Ok((_, Err(e))) => Err(e),
+                    Err(e) => Err(DownloadRequestError::other(e)),
+                }
+            },
         )
         .await
     }
@@ -317,57 +346,16 @@ impl Client {
         DownloadUtils::prepare_download_requests(downloadable, &core_media_conn)
     }
 
-    async fn download_with_request(
-        &self,
-        request: &wacore::download::DownloadRequest,
-    ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
-        let url = request.url.clone();
-        let decryption = request.decryption.clone();
-        let http_request = crate::http::HttpRequest::get(url);
-        let response = self
-            .http_client
-            .execute(http_request)
-            .await
-            .map_err(DownloadRequestError::other)?;
-
-        if response.status_code >= 300 {
-            return Err(if is_media_auth_error(response.status_code) {
-                DownloadRequestError::auth(response.status_code)
-            } else if matches!(response.status_code, 404 | 410) {
-                DownloadRequestError::not_found(response.status_code)
-            } else {
-                DownloadRequestError::other(anyhow!(
-                    "Download failed with status: {}",
-                    response.status_code
-                ))
-            });
-        }
-
-        match decryption {
-            MediaDecryption::Encrypted {
-                media_key,
-                media_type,
-            } => wacore::runtime::blocking(&*self.runtime, move || {
-                DownloadUtils::decrypt_stream(&response.body[..], &media_key, media_type)
-            })
-            .await
-            .map_err(DownloadRequestError::other),
-            MediaDecryption::Plaintext { file_sha256 } => {
-                let body = response.body;
-                wacore::runtime::blocking(&*self.runtime, move || {
-                    DownloadUtils::validate_plaintext_sha256(&body, &file_sha256)?;
-                    Ok::<Vec<u8>, anyhow::Error>(body)
-                })
-                .await
-                .map_err(DownloadRequestError::other)
-            }
-        }
-    }
-
     /// Downloads and decrypts media with streaming (constant memory usage).
     ///
     /// The entire HTTP download, decryption, and file write happen in a single
     /// blocking thread. The writer is seeked back to position 0 before returning.
+    ///
+    /// The `writer` MUST start empty. Retries/host-failover seek back to 0 and
+    /// rewrite but do NOT truncate, so a writer that already held more bytes than
+    /// the decrypted payload would keep a stale tail past the valid data. (The
+    /// in-memory [`Self::download`] gives every attempt a fresh buffer for exactly
+    /// this reason.)
     ///
     /// Memory usage: ~40KB regardless of file size (8KB read buffer + decrypt state).
     #[cfg_attr(
@@ -646,6 +634,8 @@ mod tests {
         );
     }
 
+    // `download()` uses `download_media_with_retry` (fresh buffer per attempt);
+    // cover its auth-refresh + host-failover retry behavior directly.
     #[tokio::test]
     async fn download_retries_with_forced_media_conn_refresh_after_auth_error() {
         let body = b"download me".to_vec();
@@ -715,6 +705,139 @@ mod tests {
         assert_eq!(seen_urls.len(), 2);
         assert!(seen_urls[0].contains("auth=stale-auth"));
         assert!(seen_urls[1].contains("auth=fresh-auth"));
+    }
+
+    // A generic (non-auth, non-404) error on one host must fall through to the
+    // next host within the SAME attempt — no media-conn refresh — and succeed.
+    #[tokio::test]
+    async fn download_fails_over_to_next_host_without_refresh() {
+        let body = b"failover me".to_vec();
+        let downloadable = PlaintextDownloadable {
+            direct_path: "/v/t62.7118-24/failover".to_string(),
+            file_sha256: plaintext_sha256(&body),
+        };
+        let conn = media_conn(
+            "auth-tok",
+            &["bad-host.example.com", "good-host.example.com"],
+        );
+        let refresh_calls = Arc::new(Mutex::new(Vec::new()));
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let seen_urls = Arc::new(Mutex::new(Vec::new()));
+
+        let downloaded = download_media_with_retry(
+            {
+                let refresh_calls = Arc::clone(&refresh_calls);
+                let downloadable = &downloadable;
+                let conn = conn.clone();
+                move |force| {
+                    let refresh_calls = Arc::clone(&refresh_calls);
+                    let conn = conn.clone();
+                    async move {
+                        refresh_calls.lock().await.push(force);
+                        DownloadUtils::prepare_download_requests(
+                            downloadable,
+                            &wacore::download::MediaConnection::from(&conn),
+                        )
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            {
+                let seen_urls = Arc::clone(&seen_urls);
+                let body = body.clone();
+                move |request| {
+                    let seen_urls = Arc::clone(&seen_urls);
+                    let body = body.clone();
+                    let url = request.url.clone();
+                    async move {
+                        seen_urls.lock().await.push(url.clone());
+                        if url.contains("bad-host") {
+                            Err(DownloadRequestError::other(anyhow!("connection reset")))
+                        } else {
+                            Ok(body)
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("download should fail over to the healthy host");
+
+        assert_eq!(downloaded, body);
+        // Single attempt, no refresh: a generic error doesn't invalidate the media conn.
+        assert_eq!(*refresh_calls.lock().await, vec![false]);
+        assert_eq!(*invalidations.lock().await, 0);
+        let seen_urls = seen_urls.lock().await.clone();
+        assert_eq!(seen_urls.len(), 2);
+        assert!(seen_urls[0].contains("bad-host"));
+        assert!(seen_urls[1].contains("good-host"));
+    }
+
+    // When every host fails with a generic error, the accumulated `last_err`
+    // is surfaced (not the fallback "all hosts" message) and no refresh happens.
+    #[tokio::test]
+    async fn download_propagates_last_error_when_all_hosts_fail() {
+        let body = b"never arrives".to_vec();
+        let downloadable = PlaintextDownloadable {
+            direct_path: "/v/t62.7118-24/allfail".to_string(),
+            file_sha256: plaintext_sha256(&body),
+        };
+        let conn = media_conn("auth-tok", &["host-a.example.com", "host-b.example.com"]);
+        let invalidations = Arc::new(Mutex::new(0usize));
+        let seen_urls = Arc::new(Mutex::new(Vec::new()));
+
+        let err = download_media_with_retry(
+            {
+                let downloadable = &downloadable;
+                let conn = conn.clone();
+                move |_force| {
+                    let conn = conn.clone();
+                    async move {
+                        DownloadUtils::prepare_download_requests(
+                            downloadable,
+                            &wacore::download::MediaConnection::from(&conn),
+                        )
+                    }
+                }
+            },
+            {
+                let invalidations = Arc::clone(&invalidations);
+                move || {
+                    let invalidations = Arc::clone(&invalidations);
+                    async move {
+                        *invalidations.lock().await += 1;
+                    }
+                }
+            },
+            {
+                let seen_urls = Arc::clone(&seen_urls);
+                move |request| {
+                    let seen_urls = Arc::clone(&seen_urls);
+                    let url = request.url.clone();
+                    async move {
+                        seen_urls.lock().await.push(url.clone());
+                        Err::<Vec<u8>, _>(DownloadRequestError::other(anyhow!("host {url} down")))
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("all hosts failing must surface an error");
+
+        assert!(
+            err.to_string().contains("down"),
+            "expected the propagated last_err, got: {err}"
+        );
+        assert_eq!(*invalidations.lock().await, 0);
+        assert_eq!(seen_urls.lock().await.len(), 2);
     }
 
     #[tokio::test]

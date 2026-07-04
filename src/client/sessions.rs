@@ -219,6 +219,11 @@ impl Client {
     }
 
     pub(crate) fn finish_history_sync_task(&self) {
+        // The `previous <= 1` clamp is also the underflow guard: a detached task
+        // that finishes after cleanup_connection_state() reset the counter to 0
+        // hits fetch_sub-from-0, which momentarily wraps the stored value to
+        // usize::MAX — but previous == 0 takes this branch and stores 0, so the
+        // wrap never sticks (and it never leaves the idle waiter blocked).
         let previous = self
             .history_sync_tasks_in_flight
             .fetch_sub(1, Ordering::Relaxed);
@@ -288,21 +293,32 @@ impl Client {
         use wacore::types::jid::JidExt;
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let mut jids_needing_sessions = Vec::with_capacity(jids.len());
 
-        for jid in jids {
-            let signal_addr = jid.to_protocol_address();
-            // Check cache first (includes unflushed sessions), fall back to backend
-            match self
-                .signal_cache
-                .has_session(&signal_addr, &*device_snapshot.backend)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => jids_needing_sessions.push(jid),
-                Err(e) => log::warn!("Failed to check session for {}: {}", jid.observe(), e),
-            }
-        }
+        // Probe sessions concurrently: a cold-cache multi-recipient ensure would
+        // otherwise serialize the per-device DB reads (warm hits serialize on the
+        // cache mutex anyway). Order is irrelevant — misses are chunked for the fetch.
+        use futures::StreamExt;
+        let backend = device_snapshot.backend.clone();
+        let jids_needing_sessions: Vec<Jid> = futures::stream::iter(jids)
+            .map(|jid| {
+                let backend = backend.clone();
+                async move {
+                    let signal_addr = jid.to_protocol_address();
+                    // Check cache first (includes unflushed sessions), fall back to backend.
+                    match self.signal_cache.has_session(&signal_addr, &*backend).await {
+                        Ok(true) => None,
+                        Ok(false) => Some(jid),
+                        Err(e) => {
+                            log::warn!("Failed to check session for {}: {}", jid.observe(), e);
+                            None
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(16)
+            .filter_map(|needed| async move { needed })
+            .collect()
+            .await;
 
         if jids_needing_sessions.is_empty() {
             return Ok(());
