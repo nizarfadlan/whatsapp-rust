@@ -428,16 +428,26 @@ impl SenderKeyState {
 #[derive(Debug, Clone)]
 pub struct SenderKeyRecord {
     states: VecDeque<SenderKeyState>,
+    /// An outbound chain advance not yet known durable. Sender-key message
+    /// keys/IVs derive deterministically from the iteration, so the advance
+    /// must reach storage before its ciphertext reaches the wire (unlike
+    /// decrypt advances, which re-derive forward). Transient — never
+    /// serialized; the store layer converts it into flush gating.
+    wire_gated: bool,
 }
 
 impl SenderKeyRecord {
+    /// Replaces the states wholesale, so the wire gate — which belongs to the
+    /// advance being replaced — resets with them.
     pub fn set_states_for_testing(&mut self, states: std::collections::VecDeque<SenderKeyState>) {
         self.states = states;
+        self.wire_gated = false;
     }
 
     pub fn new_empty() -> Self {
         Self {
             states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
+            wire_gated: false,
         }
     }
 
@@ -456,7 +466,24 @@ impl SenderKeyRecord {
             }
             states.push_back(SenderKeyState::from_protobuf(state));
         }
-        Ok(Self { states })
+        Ok(Self {
+            states,
+            wire_gated: false,
+        })
+    }
+
+    /// Flag an outbound chain advance; cleared by the store layer once it
+    /// owns the durability gate.
+    pub fn mark_wire_gated(&mut self) {
+        self.wire_gated = true;
+    }
+
+    pub fn is_wire_gated(&self) -> bool {
+        self.wire_gated
+    }
+
+    pub fn clear_wire_gated(&mut self) {
+        self.wire_gated = false;
     }
 
     pub fn sender_key_state(&self) -> Result<&SenderKeyState, InvalidSenderKeySessionError> {
