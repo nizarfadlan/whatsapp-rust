@@ -11,7 +11,7 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeRef};
 
 use crate::time::from_secs;
-use crate::types::call::{CallAction, CallAudioCodec, IncomingCall};
+use crate::types::call::{CallAction, CallAudioCodec, IncomingCall, VideoState};
 
 const KNOWN_ACTIONS: &[&str] = &[
     "offer",
@@ -22,6 +22,7 @@ const KNOWN_ACTIONS: &[&str] = &[
     "terminate",
     "transport",
     "relaylatency",
+    "video",
 ];
 
 pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
@@ -132,7 +133,26 @@ fn parse_media_offer(
     }
 
     let relay = find_relay(call).and_then(crate::voip::relay_parse::parse_relay_data);
-    Some(MediaOffer { encs, relay })
+    let (peer_abtest_bucket, peer_abtest_bucket_id_list) = offer
+        .get_optional_child("metadata")
+        .map(|metadata| {
+            let mut attrs = metadata.attrs();
+            (
+                attrs
+                    .optional_string("peer_abtest_bucket")
+                    .map(|value| value.into_owned()),
+                attrs
+                    .optional_string("peer_abtest_bucket_id_list")
+                    .map(|value| value.into_owned()),
+            )
+        })
+        .unwrap_or_default();
+    Some(MediaOffer {
+        encs,
+        relay,
+        peer_abtest_bucket,
+        peer_abtest_bucket_id_list,
+    })
 }
 
 /// Parse one `<enc>` node into the ciphertext plus the wire `type`/`v` needed to decrypt the callKey.
@@ -289,6 +309,28 @@ fn parse_action(node: &NodeRef<'_>) -> Result<CallAction> {
                 call_creator,
             }
         }
+        "video" => {
+            let state_raw = attrs
+                .optional_string("state")
+                .and_then(|s| s.parse::<i32>().ok())
+                .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
+            let orientation = attrs
+                .optional_string("device_orientation")
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|orientation| *orientation <= 3);
+            let dec = attrs.optional_string("dec").map(|s| s.into_owned());
+            // The upgrade-request marker attr and the server-enriched knobs; consumed (their
+            // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
+            let _ = attrs.optional_string("voip_settings");
+            attrs.finish().map_err(|e| anyhow!("<video> attrs: {e}"))?;
+            CallAction::VideoState {
+                call_id,
+                call_creator,
+                state: VideoState::from(state_raw),
+                orientation,
+                dec,
+            }
+        }
         "terminate" => {
             // WA Web gates the call-log outcome on `reason` (missed vs accepted/rejected-elsewhere),
             // so surface it instead of dropping it.
@@ -352,10 +394,15 @@ pub fn build_offer_ack_receipt(call: &IncomingCall, own_ad: Option<&Jid>) -> Opt
 // Stanza ids generated from random bytes (heartbeat, preaccept) are passed in so the
 // builders stay pure; the I/O layer supplies them.
 
-/// Capability blob for `<offer>`/`<accept>` (ver=1).
-pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x13];
-/// Capability blob for `<preaccept>` (ver=1).
-pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe4, 0xbb, 0x07];
+/// Capability blob for `<offer>`/`<accept>`/video `<preaccept>` (ver=1). Byte 4 is `0xe0`, matching
+/// real WhatsApp captures (an earlier `0xe4` was tolerated for audio but is not what the client sends).
+pub const CAPABILITY_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13];
+/// Capability blob for an audio-only `<preaccept>` (ver=1).
+pub const CAPABILITY_PREACCEPT: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x07];
+/// Capability blob a client places in a VIDEO `<offer>`: byte 5 is `0xfa` (video) vs the audio
+/// `0xbb`. Observed in a real from-start video offer. A video CALLEE preaccepts with [`CAPABILITY_OFFER`]
+/// (`0xbb`), not this.
+pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
 
 /// `<terminate reason>` wire tokens. The caller-driven sibling dismiss SENDS the `*_ELSEWHERE`
 /// ones; the receive path maps every reason to a call-log outcome (see WA Web's
@@ -394,11 +441,15 @@ pub struct OfferParams<'a> {
     /// keep the `<destination><to jid>` shape so the surviving device stays explicitly addressed (a
     /// bare `<enc>` drops its jid and could misroute to the primary device).
     pub multi_device: bool,
+    /// Advertise a `<video>` child: a video-from-the-start call. The node shape and its position
+    /// (after the `<audio>` children) come from a WA Web capture; unvalidated against the real
+    /// server's 439 child-order enforcement.
+    pub video: bool,
 }
 
 /// `<call to=peer><offer call-id call-creator>…</offer></call>` with the mandatory
-/// child order: privacy → audio(8k) → audio(16k) → net → capability → destination|enc →
-/// encopt → device-identity.
+/// child order: privacy → audio(8k) → audio(16k) → [video] → net → capability →
+/// destination|enc → encopt → device-identity.
 pub fn build_offer(p: &OfferParams<'_>) -> Node {
     let mut children: Vec<Node> = Vec::new();
     if let Some(privacy) = p.privacy_token {
@@ -416,6 +467,9 @@ pub fn build_offer(p: &OfferParams<'_>) -> Node {
             .attr("rate", "16000")
             .build(),
     );
+    if p.video {
+        children.push(video_offer_node());
+    }
     children.push(NodeBuilder::new("net").attr("medium", "3").build());
     if let Some(cap) = p.capability {
         children.push(capability_node(cap));
@@ -477,11 +531,19 @@ pub struct AcceptParams<'a> {
     pub rte: Option<&'a [u8]>,
     pub voip_settings: Option<&'a [u8]>,
     pub capability: Option<&'a [u8]>,
+    /// Include the captured callee-side `<video>` child for a video-from-start accept.
+    pub video: bool,
+    pub peer_abtest_bucket: Option<&'a str>,
+    pub peer_abtest_bucket_id_list: Option<&'a str>,
 }
 
-/// `<accept>`: audio → [te priority=2] → net medium=2 → encopt → [capability] → [rte] → [voip_settings].
+/// `<accept>`: audio → [video] → [te priority=2] → net medium=2 → encopt → [metadata] →
+/// [capability] → [rte] → [voip_settings].
 pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     let mut children: Vec<Node> = p.audio_rates.iter().map(|rate| audio_opus(rate)).collect();
+    if p.video {
+        children.push(video_accept_node());
+    }
     if let Some(te) = p.relay_te {
         children.push(
             NodeBuilder::new("te")
@@ -492,6 +554,16 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     }
     children.push(NodeBuilder::new("net").attr("medium", "2").build());
     children.push(encopt_node());
+    if p.peer_abtest_bucket.is_some() || p.peer_abtest_bucket_id_list.is_some() {
+        let mut metadata = NodeBuilder::new("metadata");
+        if let Some(bucket) = p.peer_abtest_bucket {
+            metadata = metadata.attr("peer_abtest_bucket", bucket.to_string());
+        }
+        if let Some(ids) = p.peer_abtest_bucket_id_list {
+            metadata = metadata.attr("peer_abtest_bucket_id_list", ids.to_string());
+        }
+        children.push(metadata.build());
+    }
     if let Some(cap) = p.capability {
         children.push(capability_node(cap));
     }
@@ -511,6 +583,41 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
         Some(p.id),
         offer_action("accept", p.call_id, p.call_creator, children),
     )
+}
+
+/// Default initiator-side geometry used by the WaCalls reference.
+const VIDEO_SCREEN_WIDTH: &str = "1920";
+const VIDEO_SCREEN_HEIGHT: &str = "1080";
+
+/// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
+fn video_offer_node() -> Node {
+    NodeBuilder::new("video")
+        .attr("enc", "h264")
+        .attr("dec", "h264")
+        .attr("orientation", "0")
+        .attr("screen_width", VIDEO_SCREEN_WIDTH)
+        .attr("screen_height", VIDEO_SCREEN_HEIGHT)
+        .attr("device_orientation", "0")
+        .build()
+}
+
+/// `<video>` byte-matching a captured from-start video callee.
+fn video_accept_node() -> Node {
+    NodeBuilder::new("video")
+        .attr("dec", "H264")
+        .attr("device_orientation", "0")
+        .build()
+}
+
+/// `<video>` for a `<preaccept>`, byte-matching a real from-start video callee: `dec` +
+/// `device_orientation` + `screen_width="0" screen_height="0"` (the real client sends zero here).
+fn video_preaccept_node() -> Node {
+    NodeBuilder::new("video")
+        .attr("dec", "H264")
+        .attr("device_orientation", "0")
+        .attr("screen_width", "0")
+        .attr("screen_height", "0")
+        .build()
 }
 
 /// One `<audio enc=opus rate=…>` advertisement child.
@@ -534,17 +641,27 @@ fn capability_node(blob: &[u8]) -> Node {
         .build()
 }
 
-/// `<preaccept>`: audio → encopt → capability(preaccept blob). `id` is the random call-wrapper id.
+/// `<preaccept>`: audio → [video] → encopt → capability. `id` is the random call-wrapper id. A video
+/// callee advertises the `<video>` decoder here; the capability stays the `0xbb` [`CAPABILITY_OFFER`]
+/// blob (byte-matched to a real from-start video callee — the `0xfa` variant is the CALLER's offer).
 pub fn build_preaccept(
     call_id: &str,
     to: &Jid,
     call_creator: &Jid,
     wrapper_id: &str,
     audio_rates: &[&str],
+    video: bool,
 ) -> Node {
     let mut children: Vec<Node> = audio_rates.iter().map(|rate| audio_opus(rate)).collect();
+    if video {
+        children.push(video_preaccept_node());
+    }
     children.push(encopt_node());
-    children.push(capability_node(&CAPABILITY_PREACCEPT));
+    children.push(capability_node(if video {
+        &CAPABILITY_OFFER
+    } else {
+        &CAPABILITY_PREACCEPT
+    }));
     call_wrap(
         to,
         Some(wrapper_id),
@@ -654,6 +771,63 @@ pub fn build_terminate(p: &TerminateParams<'_>) -> Node {
         action = action.attr("reason", reason.to_string());
     }
     call_wrap(p.to, p.id, action.build())
+}
+
+pub struct VideoStateParams<'a> {
+    pub call_id: &'a str,
+    pub to: &'a Jid,
+    /// The `<call>` wrapper id. Load-bearing: the peer's typed `<ack type="video">` correlates to
+    /// it, so an idless upgrade request can't be acked and the flow times out and reverts. The pure
+    /// builder takes it; the I/O layer supplies the generated id (mirrors `build_offer`).
+    pub id: &'a str,
+    pub call_creator: &'a Jid,
+    pub state: VideoState,
+    /// `dec` attr: codecs we can decode (`"H264"` on the upgrade request, `"H264,AV1"` on accept).
+    pub dec: Option<&'a str>,
+    pub device_orientation: Option<u8>,
+}
+
+/// `<call to=peer id=wrapper><video call-id call-creator state=N [dec] [voip_settings="video"]
+/// [device_orientation]/></call>` — the in-call video upgrade/downgrade handshake stanza.
+pub fn build_video_state(p: &VideoStateParams<'_>) -> Node {
+    let mut action = NodeBuilder::new("video")
+        .attr("call-id", p.call_id)
+        .attr("call-creator", p.call_creator)
+        .attr("state", p.state.code().to_string());
+    if let Some(dec) = p.dec {
+        action = action.attr("dec", dec.to_string());
+    }
+    if p.state == VideoState::UpgradeRequestV2 {
+        action = action.attr("voip_settings", "video");
+    }
+    if let Some(o) = p.device_orientation {
+        action = action.attr("device_orientation", o.to_string());
+    }
+    call_wrap(p.to, Some(p.id), action.build())
+}
+
+/// Typed ack for a received `<call><video>`. The original stanza supplies routing attrs because
+/// suppressing the generic ack must not drop companion routing metadata.
+pub fn build_call_video_ack(call: &IncomingCall, original: &NodeRef<'_>) -> Option<Node> {
+    if call.stanza_id.is_empty() {
+        return None;
+    }
+    let mut ack = NodeBuilder::new("ack")
+        .attr("class", "call")
+        .attr("id", call.stanza_id.as_str())
+        .attr("to", &call.from)
+        .attr("type", "video");
+    let from = call.from.to_string();
+    if let Some(participant) = original
+        .get_attr("participant")
+        .filter(|participant| participant.as_str().as_ref() != from)
+    {
+        ack = ack.attr("participant", participant.to_node_value());
+    }
+    if let Some(recipient) = original.get_attr("recipient") {
+        ack = ack.attr("recipient", recipient.to_node_value());
+    }
+    Some(ack.build())
 }
 
 pub fn build_mute_v2(call_id: &str, to: &Jid, call_creator: &Jid, mute_state: &str) -> Node {
@@ -766,11 +940,17 @@ mod tests {
         let node = base_call_builder()
             .children([
                 offer_builder_base()
-                    .children([NodeBuilder::new("enc")
-                        .attr("v", "2")
-                        .attr("type", "pkmsg")
-                        .bytes(vec![1, 2, 3, 4])
-                        .build()])
+                    .children([
+                        NodeBuilder::new("enc")
+                            .attr("v", "2")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![1, 2, 3, 4])
+                            .build(),
+                        NodeBuilder::new("metadata")
+                            .attr("peer_abtest_bucket", "video_interop_holdout")
+                            .attr("peer_abtest_bucket_id_list", "110001,110002")
+                            .build(),
+                    ])
                     .build(),
                 relay,
             ])
@@ -784,6 +964,14 @@ mod tests {
         assert_eq!(enc.enc_type, "pkmsg");
         assert_eq!(enc.version, 2);
         assert_eq!(enc.ciphertext, vec![1, 2, 3, 4]);
+        assert_eq!(
+            media.peer_abtest_bucket.as_deref(),
+            Some("video_interop_holdout")
+        );
+        assert_eq!(
+            media.peer_abtest_bucket_id_list.as_deref(),
+            Some("110001,110002")
+        );
         let rd = media.relay.expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);
@@ -1418,6 +1606,7 @@ mod tests {
             device_identity: Some(&[0xcc]),
             id: Some("OFFER-STANZA-ID"),
             multi_device: false,
+            video: false,
         });
         // Single device key → bare <enc> (not <destination>).
         assert_eq!(
@@ -1474,6 +1663,7 @@ mod tests {
             device_identity: None,
             id: None,
             multi_device: false,
+            video: false,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
@@ -1501,6 +1691,7 @@ mod tests {
             device_identity: None,
             id: None,
             multi_device: true,
+            video: false,
         });
         let tags = child_tags(&call);
         assert!(tags.contains(&"destination".to_string()));
@@ -1524,6 +1715,9 @@ mod tests {
             rte: None,
             voip_settings: None,
             capability: Some(&CAPABILITY_OFFER),
+            video: false,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
         });
         assert_eq!(
             child_tags(&accept),
@@ -1540,11 +1734,54 @@ mod tests {
             Some("ACCEPT-STANZA-ID")
         );
 
-        let pre = build_preaccept("CID", &peer, &creator, "abcd1234", &["8000", "16000"]);
+        let pre = build_preaccept(
+            "CID",
+            &peer,
+            &creator,
+            "abcd1234",
+            &["8000", "16000"],
+            false,
+        );
         assert_eq!(child_tags(&pre), ["audio", "audio", "encopt", "capability"]);
         assert_eq!(
             pre.as_node_ref().attrs().optional_string("id").as_deref(),
             Some("abcd1234")
+        );
+    }
+
+    #[test]
+    fn video_preaccept_advertises_video_and_video_capability() {
+        let peer = peer();
+        let creator = creator();
+        let pre = build_preaccept("CID", &peer, &creator, "abcd1234", &["16000"], true);
+        assert_eq!(child_tags(&pre), ["audio", "video", "encopt", "capability"]);
+        let pre_ref = pre.as_node_ref();
+        let action = &pre_ref.children().unwrap()[0];
+        let video = action.get_optional_child("video").unwrap();
+        assert_eq!(
+            video.attrs().optional_string("dec").as_deref(),
+            Some("H264")
+        );
+        // Real from-start video callee sends screen_width/height="0" in the preaccept <video>.
+        assert_eq!(
+            video.attrs().optional_string("screen_width").as_deref(),
+            Some("0")
+        );
+        // A video callee preaccepts with the 0xbb CAPABILITY_OFFER blob, not the 0xfa offer blob.
+        let cap = action.get_optional_child("capability").unwrap();
+        assert_eq!(cap.content_bytes().unwrap(), &CAPABILITY_OFFER);
+
+        // An audio preaccept keeps the audio capability blob.
+        let audio_pre = build_preaccept("CID", &peer, &creator, "id", &["16000"], false);
+        let audio_ref = audio_pre.as_node_ref();
+        let audio_action = &audio_ref.children().unwrap()[0];
+        assert_eq!(
+            audio_action
+                .get_optional_child("capability")
+                .unwrap()
+                .content_bytes()
+                .unwrap(),
+            &CAPABILITY_PREACCEPT
         );
     }
 
@@ -1658,5 +1895,358 @@ mod tests {
             action.get_optional_child("destination").is_none(),
             "terminate must not use a <destination> block"
         );
+    }
+
+    #[test]
+    fn video_state_wire_enum_round_trips() {
+        let known = [
+            (0, VideoState::Disabled),
+            (1, VideoState::Enabled),
+            (3, VideoState::UpgradeRequest),
+            (4, VideoState::UpgradeAccept),
+            (5, VideoState::UpgradeReject),
+            (6, VideoState::Stopped),
+            (8, VideoState::UpgradeCancel),
+            (11, VideoState::UpgradeRequestV2),
+        ];
+        for (code, state) in known {
+            assert_eq!(VideoState::from(code), state);
+            assert_eq!(state.code(), code);
+        }
+        // Forward-compat: an unknown state degrades to Unknown, preserving the wire value.
+        assert_eq!(VideoState::from(99), VideoState::Unknown(99));
+        assert_eq!(VideoState::Unknown(99).code(), 99);
+    }
+
+    fn video_call_node(attrs: &[(&'static str, &str)]) -> Node {
+        let mut video = NodeBuilder::new("video")
+            .attr("call-id", "CID")
+            .attr("call-creator", fake_caller_lid());
+        for (k, v) in attrs {
+            video = video.attr(k, v.to_string());
+        }
+        base_call_builder().children([video.build()]).build()
+    }
+
+    #[test]
+    fn parse_video_upgrade_request() {
+        let node = video_call_node(&[("state", "11"), ("dec", "H264"), ("voip_settings", "video")]);
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        match call.action {
+            CallAction::VideoState {
+                state,
+                dec,
+                orientation,
+                ..
+            } => {
+                assert_eq!(state, VideoState::UpgradeRequestV2);
+                assert_eq!(dec.as_deref(), Some("H264"));
+                assert_eq!(orientation, None);
+            }
+            other => panic!("expected VideoState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_video_accept_downgrade_and_unknown_states() {
+        let accept = video_call_node(&[("state", "4"), ("dec", "H264,AV1")]);
+        let call = parse_call_stanza(&as_ref(&accept)).unwrap().unwrap();
+        assert!(matches!(
+            call.action,
+            CallAction::VideoState {
+                state: VideoState::UpgradeAccept,
+                ..
+            }
+        ));
+
+        let downgrade = video_call_node(&[("state", "6"), ("device_orientation", "2")]);
+        let call = parse_call_stanza(&as_ref(&downgrade)).unwrap().unwrap();
+        match call.action {
+            CallAction::VideoState {
+                state, orientation, ..
+            } => {
+                assert_eq!(state, VideoState::Stopped);
+                assert_eq!(orientation, Some(2));
+            }
+            other => panic!("expected VideoState, got {other:?}"),
+        }
+
+        let malformed = video_call_node(&[("state", "1"), ("device_orientation", "255")]);
+        let call = parse_call_stanza(&as_ref(&malformed)).unwrap().unwrap();
+        assert!(matches!(
+            call.action,
+            CallAction::VideoState {
+                orientation: None,
+                ..
+            }
+        ));
+
+        // A future state number parses to Unknown rather than failing the stanza.
+        let future = video_call_node(&[("state", "42")]);
+        let call = parse_call_stanza(&as_ref(&future)).unwrap().unwrap();
+        assert!(matches!(
+            call.action,
+            CallAction::VideoState {
+                state: VideoState::Unknown(42),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_video_missing_or_garbage_state_errors() {
+        let missing = video_call_node(&[("dec", "H264")]);
+        assert!(parse_call_stanza(&as_ref(&missing)).is_err());
+        let garbage = video_call_node(&[("state", "not-a-number")]);
+        assert!(parse_call_stanza(&as_ref(&garbage)).is_err());
+    }
+
+    #[test]
+    fn build_video_state_upgrade_carries_marker_downgrade_does_not() {
+        let peer = peer();
+        let creator = creator();
+        let upgrade = build_video_state(&VideoStateParams {
+            call_id: "CID",
+            to: &peer,
+            id: "VIDEO-WRAP-ID",
+            call_creator: &creator,
+            state: VideoState::UpgradeRequestV2,
+            dec: Some("H264"),
+            device_orientation: None,
+        });
+        let r = upgrade.as_node_ref();
+        assert_eq!(
+            r.attrs().optional_string("to").as_deref(),
+            Some(peer.to_string().as_str())
+        );
+        assert_eq!(
+            r.attrs().optional_string("id").as_deref(),
+            Some("VIDEO-WRAP-ID"),
+            "the <call> wrapper must carry the id the peer's typed ack correlates to"
+        );
+        let action = &r.children().unwrap()[0];
+        assert_eq!(action.tag, "video");
+        assert_eq!(
+            action.attrs().optional_string("state").as_deref(),
+            Some("11")
+        );
+        assert_eq!(
+            action.attrs().optional_string("dec").as_deref(),
+            Some("H264")
+        );
+        assert_eq!(
+            action.attrs().optional_string("voip_settings").as_deref(),
+            Some("video"),
+            "the upgrade request must carry the marker attr"
+        );
+
+        let downgrade = build_video_state(&VideoStateParams {
+            call_id: "CID",
+            to: &peer,
+            id: "VIDEO-WRAP-ID-2",
+            call_creator: &creator,
+            state: VideoState::Stopped,
+            dec: None,
+            device_orientation: Some(0),
+        });
+        let action = downgrade.as_node_ref().children().unwrap()[0].to_owned();
+        let ar = action.as_node_ref();
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("6"));
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "a downgrade must NOT carry the marker (it re-arms the peer's video)"
+        );
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+
+        // Round-trip: our own builder output parses back to the same action.
+        let wrapped = base_call_builder()
+            .children([upgrade.as_node_ref().children().unwrap()[0].to_owned()])
+            .build();
+        let call = parse_call_stanza(&as_ref(&wrapped)).unwrap().unwrap();
+        assert!(matches!(
+            call.action,
+            CallAction::VideoState {
+                state: VideoState::UpgradeRequestV2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn offer_and_accept_video_advertisement() {
+        let peer = peer();
+        let creator = creator();
+        let dk = OfferDeviceKey {
+            device_jid: peer.clone(),
+            ciphertext: vec![1, 2, 3],
+            enc_type: "msg".into(),
+        };
+        let base = OfferParams {
+            call_id: "CID",
+            to: &peer,
+            call_creator: &creator,
+            device_keys: std::slice::from_ref(&dk),
+            privacy_token: None,
+            capability: None,
+            device_identity: None,
+            id: None,
+            multi_device: false,
+            video: true,
+        };
+        let offer = build_offer(&base);
+        // The <video> child sits right after the <audio> children (capture-observed position).
+        assert_eq!(
+            child_tags(&offer),
+            ["audio", "audio", "video", "net", "enc", "encopt"]
+        );
+        // And our own parser reads it back as a video offer.
+        let call = parse_call_stanza(&offer.as_node_ref()).ok().flatten();
+        assert!(
+            call.is_none(),
+            "an outbound offer has no from/t; shape-only check above"
+        );
+
+        let no_video = build_offer(&OfferParams {
+            video: false,
+            ..base
+        });
+        assert!(!child_tags(&no_video).contains(&"video".to_string()));
+
+        let accept = build_accept(&AcceptParams {
+            call_id: "CID",
+            to: &peer,
+            id: "ACCEPT-ID",
+            call_creator: &creator,
+            audio_rates: &["16000"],
+            relay_te: None,
+            rte: None,
+            voip_settings: None,
+            capability: None,
+            video: true,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
+        });
+        assert_eq!(child_tags(&accept), ["audio", "video", "net", "encopt"]);
+        // Captured callee accept: dec + device_orientation, without enc or screen geometry.
+        let vnode = accept.as_node_ref().children().unwrap()[0]
+            .children()
+            .unwrap()
+            .iter()
+            .find(|c| c.tag == "video")
+            .unwrap()
+            .to_owned();
+        let vr = vnode.as_node_ref();
+        assert_eq!(vr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            vr.attrs().optional_string("enc"),
+            None,
+            "accept <video> must not advertise enc"
+        );
+        assert_eq!(vr.attrs().optional_string("screen_width"), None);
+
+        // The offer's <video> carries the decoder/geometry advertisement (WaCalls reference form).
+        let ovnode = offer.as_node_ref().children().unwrap()[0]
+            .children()
+            .unwrap()
+            .iter()
+            .find(|c| c.tag == "video")
+            .unwrap()
+            .to_owned();
+        let ovr = ovnode.as_node_ref();
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+
+        let accept = build_accept(&AcceptParams {
+            call_id: "CID",
+            to: &peer,
+            id: "ACCEPT-ID-METADATA",
+            call_creator: &creator,
+            audio_rates: &["16000"],
+            relay_te: None,
+            rte: None,
+            voip_settings: None,
+            capability: None,
+            video: true,
+            peer_abtest_bucket: Some("video_interop_holdout"),
+            peer_abtest_bucket_id_list: Some("110001,110002"),
+        });
+        assert_eq!(
+            child_tags(&accept),
+            ["audio", "video", "net", "encopt", "metadata"]
+        );
+        let accept_ref = accept.as_node_ref();
+        let metadata = accept_ref.children().unwrap()[0]
+            .get_optional_child("metadata")
+            .unwrap();
+        assert_eq!(
+            metadata
+                .attrs()
+                .optional_string("peer_abtest_bucket")
+                .as_deref(),
+            Some("video_interop_holdout")
+        );
+        assert_eq!(
+            metadata
+                .attrs()
+                .optional_string("peer_abtest_bucket_id_list")
+                .as_deref(),
+            Some("110001,110002")
+        );
+    }
+
+    #[test]
+    fn video_ack_is_typed_and_requires_a_stanza_id() {
+        let node = video_call_node(&[("state", "11"), ("voip_settings", "video")]);
+        let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
+        let ack =
+            build_call_video_ack(&call, &as_ref(&node)).expect("ack for an id-carrying stanza");
+        let r = ack.as_node_ref();
+        assert_eq!(r.tag, "ack");
+        assert_eq!(r.attrs().optional_string("class").as_deref(), Some("call"));
+        assert_eq!(
+            r.attrs().optional_string("type").as_deref(),
+            Some("video"),
+            "the ack must be typed: an untyped ack makes the requester revert the upgrade"
+        );
+        assert_eq!(
+            r.attrs().optional_string("id").as_deref(),
+            Some("STANZA-ID-0001")
+        );
+        assert_eq!(
+            r.attrs().optional_string("to").as_deref(),
+            Some(fake_caller_lid().to_string().as_str())
+        );
+
+        let participant = fake_caller_lid().with_device(3);
+        let recipient = fake_caller_pn();
+        let routed = base_call_builder()
+            .attr("participant", &participant)
+            .attr("recipient", &recipient)
+            .children([NodeBuilder::new("video")
+                .attr("call-id", "CID")
+                .attr("call-creator", fake_caller_lid())
+                .attr("state", "11")
+                .build()])
+            .build();
+        let routed_call = parse_call_stanza(&as_ref(&routed)).unwrap().unwrap();
+        let routed_ack = build_call_video_ack(&routed_call, &as_ref(&routed)).unwrap();
+        let routed_ref = routed_ack.as_node_ref();
+        assert_eq!(
+            routed_ref.attrs().optional_jid("participant"),
+            Some(participant)
+        );
+        assert_eq!(
+            routed_ref.attrs().optional_jid("recipient"),
+            Some(recipient)
+        );
+
+        // No stanza id -> nothing to ack-correlate; the builder refuses.
+        let mut idless = call.clone();
+        idless.stanza_id = String::new();
+        assert!(build_call_video_ack(&idless, &as_ref(&node)).is_none());
     }
 }

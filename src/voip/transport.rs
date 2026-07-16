@@ -1,7 +1,7 @@
 //! Relay media transport: a pre-negotiated WebRTC DataChannel over SCTP-over-DTLS-over-UDP
 //! to a single WhatsApp relay endpoint. The synthetic-SDP / wrtc dance reduces, at this layer,
 //! to: connect a UDP socket to the relay, DTLS-handshake as the client (self-signed cert,
-//! server-cert verification skipped, since SRTP keys come from callKey/hbh_key, not DTLS),
+//! server-cert verification skipped, since SRTP keys come from callKey, not DTLS),
 //! run an SCTP association over it, and open the pre-negotiated id=0 DataChannel that carries
 //! STUN/RTP/RTCP as binary messages.
 
@@ -547,7 +547,7 @@ mod udp_relay_e2e {
 
     use wacore::voip::engine::{CallConfig, CallEvent, SequentialTxIds};
     use wacore::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
-    use wacore::voip::{CallChannels, CallEngine};
+    use wacore::voip::{CallChannels, CallEngine, video_control_channel};
     use webrtc_dtls::config::Config as DtlsConfig;
     use webrtc_sctp::association::{Association, Config as SctpConfig};
 
@@ -573,6 +573,7 @@ mod udp_relay_e2e {
             integrity_key: b"relay-key".to_vec(),
             warp_mi_tag_len: 4,
             enable_media: true,
+            enable_video: false,
             enable_sframe: false,
         }
     }
@@ -737,6 +738,9 @@ mod udp_relay_e2e {
                     speaker: spk_tx,
                     events: ev_tx,
                     rekey: None,
+                    video_in: async_channel::bounded(1).1,
+                    video_out: async_channel::bounded(1).0,
+                    video_ctl: video_control_channel().1,
                 },
                 eng,
             ));

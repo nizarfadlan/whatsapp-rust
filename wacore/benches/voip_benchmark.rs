@@ -112,6 +112,7 @@ fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirectio
         integrity_key: b"relay-key".to_vec(),
         warp_mi_tag_len: 4,
         enable_media: true,
+        enable_video: false,
         enable_sframe: false,
     }
 }
@@ -128,7 +129,7 @@ fn started_engine() -> CallEngine {
 
 fn started_engine_from(cfg: CallConfig) -> CallEngine {
     let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-    eng.start(0);
+    eng.start(0, 0);
     drain(&mut eng);
     eng
 }
@@ -393,6 +394,7 @@ mod framing {
             timestamp: 0x0009_6000,
             ssrc: 0xDEAD_BEEF,
             extension_word: Some(0x3001_0000),
+            video_extension: None,
         }
     }
 

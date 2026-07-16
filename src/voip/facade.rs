@@ -11,11 +11,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::warn;
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
-use wacore::stanza::call::{CAPABILITY_OFFER, OfferDeviceKey, OfferParams, build_offer};
-use wacore::types::call::{CallAction, IncomingCall};
+use wacore::stanza::call::{
+    CAPABILITY_OFFER, CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, VideoStateParams,
+    build_offer, build_video_state,
+};
+use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
-use wacore::voip::{CallChannels, CallConfig, CallEngine, CallEvent};
+use wacore::voip::{
+    CallChannels, CallConfig, CallEngine, CallEvent, VideoControl, VideoControlReceiver,
+    VideoControlSender, VideoFrame, video_control_channel,
+};
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 
@@ -23,6 +29,7 @@ use crate::client::{CallError, Client};
 use crate::voip::audio::{AudioSink, AudioSource, WA_FRAME_SAMPLES};
 use crate::voip::driver::{RandTxIds, run_call_tokio};
 use crate::voip::transport::RelayMediaChannelFactory;
+use crate::voip::video::{VideoSink, VideoSource};
 
 /// Builder returned by [`Voip::accept`](super::super::client::voip::Voip::accept). Holds the offer
 /// and, once [`audio`](Self::audio) is called, the source/sink, then [`start`](Self::start) drives
@@ -32,6 +39,7 @@ pub struct AcceptCall<'a> {
     pub(crate) incoming: &'a IncomingCall,
     source: Option<Arc<dyn AudioSource>>,
     sink: Option<Arc<dyn AudioSink>>,
+    video: Option<VideoEndpoints>,
 }
 
 impl<'a> AcceptCall<'a> {
@@ -41,6 +49,7 @@ impl<'a> AcceptCall<'a> {
             incoming,
             source: None,
             sink: None,
+            video: None,
         }
     }
 
@@ -53,6 +62,18 @@ impl<'a> AcceptCall<'a> {
     {
         self.source = Some(Arc::new(source));
         self.sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Answer with VIDEO media as well: `source` supplies our encoded H.264 AUs, `sink` receives
+    /// the peer's. Use for a video-from-the-start offer (`CallAction::Offer { is_video: true }`);
+    /// an audio-only call can upgrade later via [`CallHandle::start_video`].
+    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.video = Some(VideoEndpoints::new(source, sink));
         self
     }
 
@@ -75,6 +96,12 @@ impl<'a> AcceptCall<'a> {
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
+        let video = self.video.take();
+        if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
         // Answering consumes the ringing flag now, BEFORE the media-setup awaits (callKey decrypt /
         // relay connect): a peer <terminate> racing this window must not record a missed call for a
         // call we are answering. A failed start() leaves it cleared -- an attempted answer reads as
@@ -82,7 +109,7 @@ impl<'a> AcceptCall<'a> {
         self.client
             .call_registry()
             .take_ringing(self.incoming.action.call_id());
-        let (engine, call_id, addr) = self.build_engine().await?;
+        let (engine, call_id, addr) = self.build_engine(video.is_some()).await?;
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state already ran with no registry entry to abort, so bail
         // rather than register + connect a relay that would outlive the connection.
@@ -90,11 +117,12 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
-        let session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip::CallSession::new_incoming(
             &call_id,
             self.incoming.from.clone(),
             self.incoming.action.call_creator().clone(),
         );
+        session.is_video = video.is_some();
         spawn_call(
             self.client,
             call_id,
@@ -103,6 +131,7 @@ impl<'a> AcceptCall<'a> {
             &factory,
             source,
             sink,
+            video,
         )
         .await
     }
@@ -110,7 +139,10 @@ impl<'a> AcceptCall<'a> {
     /// Build the [`CallEngine`] from the offer: decrypt the callKey over the Signal session, then
     /// assemble the incoming-call config from the parsed relay. No network I/O beyond the Signal
     /// session the decrypt needs.
-    async fn build_engine(&self) -> Result<(CallEngine, String, SocketAddr), CallError> {
+    async fn build_engine(
+        &self,
+        enable_video: bool,
+    ) -> Result<(CallEngine, String, SocketAddr), CallError> {
         let media = self.incoming.media.as_ref().ok_or(CallError::NotAnOffer)?;
         let CallAction::Offer {
             call_id,
@@ -161,8 +193,9 @@ impl<'a> AcceptCall<'a> {
             .as_ref()
             .ok_or(CallError::Media("offer carried no <relay>"))?;
 
-        let config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
+        let mut config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
             .map_err(|e| CallError::Setup(e.to_string()))?;
+        config.enable_video = enable_video;
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
@@ -180,6 +213,7 @@ pub struct OutgoingCall<'a> {
     pub(crate) peer: &'a Jid,
     source: Option<Arc<dyn AudioSource>>,
     sink: Option<Arc<dyn AudioSink>>,
+    video: Option<VideoEndpoints>,
 }
 
 impl<'a> OutgoingCall<'a> {
@@ -189,6 +223,7 @@ impl<'a> OutgoingCall<'a> {
             peer,
             source: None,
             sink: None,
+            video: None,
         }
     }
 
@@ -201,6 +236,18 @@ impl<'a> OutgoingCall<'a> {
     {
         self.source = Some(Arc::new(source));
         self.sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Place a VIDEO call: the offer advertises `<video>` and the media plane carries H.264 both
+    /// ways once the call connects. An audio-only call can upgrade later via
+    /// [`CallHandle::start_video`].
+    pub fn video<S, K>(mut self, source: S, sink: K) -> Self
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.video = Some(VideoEndpoints::new(source, sink));
         self
     }
 
@@ -249,6 +296,12 @@ impl<'a> OutgoingCall<'a> {
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
         let source = self.source.take().ok_or(CallError::MissingAudio)?;
         let sink = self.sink.take().ok_or(CallError::MissingAudio)?;
+        let video = self.video.take();
+        if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
 
         // WA Web `_e()`: call-id is "00" + 15 random bytes as lowercase hex (32 hex chars total).
         let call_id = gen_call_id();
@@ -344,8 +397,28 @@ impl<'a> OutgoingCall<'a> {
             &ring_devices,
             source,
             sink,
+            video,
         )
         .await
+    }
+}
+
+/// The video source/sink pair a builder's `.video()` provided.
+struct VideoEndpoints {
+    source: Arc<dyn VideoSource>,
+    sink: Arc<dyn VideoSink>,
+}
+
+impl VideoEndpoints {
+    fn new<S: VideoSource, K: VideoSink>(source: S, sink: K) -> Self {
+        Self {
+            source: Arc::new(source),
+            sink: Arc::new(sink),
+        }
+    }
+
+    fn has_valid_timing(&self) -> bool {
+        self.source.rtp_timestamp_stride() != 0
     }
 }
 
@@ -371,6 +444,14 @@ fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec
         return Err(CallError::MissingDeviceIdentity);
     }
     Ok(kept)
+}
+
+fn offer_capability(video: bool) -> &'static [u8] {
+    if video {
+        &CAPABILITY_VIDEO_OFFER
+    } else {
+        &CAPABILITY_OFFER
+    }
 }
 
 /// Drain every dormant outgoing call (relay never arrived) and notify each one's `ended` so any
@@ -408,6 +489,7 @@ async fn place_call(
     ring_devices: &[Jid],
     source: Arc<dyn AudioSource>,
     sink: Arc<dyn AudioSink>,
+    video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
     // The offer keeps the addressed `<destination><to jid>` shape whenever the callee is multi-device
     // (computed before any pkmsg/encrypt filtering), even if one encryptable survivor remains.
@@ -524,12 +606,13 @@ async fn place_call(
         call_creator,
         device_keys: &device_keys,
         privacy_token: privacy_token.as_deref(),
-        capability: Some(&CAPABILITY_OFFER),
+        capability: Some(offer_capability(video.is_some())),
         device_identity: device_identity.as_deref(),
         id: Some(&offer_stanza_id),
         // Keep the addressed `<destination>` shape for a multi-device callee even if encryption
         // failures left a single surviving key, so that key stays tied to its device.
         multi_device,
+        video: video.is_some(),
     });
 
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't
@@ -543,6 +626,7 @@ async fn place_call(
     let registry = client.call_registry();
     let mut session =
         wacore::voip::CallSession::new_outgoing(&call_id, peer.clone(), call_creator.clone());
+    session.is_video = video.is_some();
     // The rung device set lives on the session so an inbound <accept>/<reject> from one callee device
     // can dismiss the rest (caller-driven accepted_elsewhere); it is dropped automatically whenever the
     // call deregisters (every end path removes the registry entry). Use the FULL server-rung set, NOT
@@ -571,6 +655,17 @@ async fn place_call(
     let (rekey_tx, rekey_rx) = async_channel::bounded::<String>(1);
     registry.set_rekey_sender(&call_id, generation, rekey_tx);
 
+    // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
+    // CallHandle::start_video need the senders even when the call starts audio-only.
+    let video_shared = Arc::new(VideoShared::new());
+    registry.set_video_channels(
+        &call_id,
+        generation,
+        ev_tx.clone(),
+        video_shared.ctl_tx.clone(),
+        video_teardown_hook(&video_shared),
+    );
+
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
         .pending_outgoing_calls
@@ -585,6 +680,8 @@ async fn place_call(
                 call_key: call_key.to_vec(),
                 source,
                 sink,
+                video,
+                video_shared: video_shared.clone(),
                 muted: muted.clone(),
                 ended: ended.clone(),
                 ev_tx,
@@ -621,10 +718,22 @@ async fn place_call(
         call_creator: call_creator.clone(),
         client_registry: registry,
         pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        client: client_weak(client),
         muted,
+        video: video_shared,
         events: ev_rx,
         ended,
     })
+}
+
+/// The client's own `Weak`, for handles that need to reach back (send a `<video>` stanza) without
+/// keeping the client alive.
+fn client_weak(client: &Client) -> std::sync::Weak<Client> {
+    client
+        .self_weak
+        .get()
+        .cloned()
+        .unwrap_or_else(std::sync::Weak::new)
 }
 
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
@@ -768,6 +877,10 @@ pub(crate) struct PendingOutgoing {
     call_key: Vec<u8>,
     source: Arc<dyn AudioSource>,
     sink: Arc<dyn AudioSink>,
+    /// `.video()` endpoints for a video-from-the-start call; `None` for audio-only.
+    video: Option<VideoEndpoints>,
+    /// The handle's video plumbing (created at place time so `start_video` works while dormant).
+    video_shared: Arc<VideoShared>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
@@ -822,7 +935,7 @@ pub(crate) async fn attach_outgoing_relay(
     // (no pending entry left for a later hangup to drain). Build everything in a fallible block and, on
     // any early-return error in this window, reap the generation and notify `ended` before propagating.
     let build = (|| {
-        let config = CallConfig::for_outgoing(
+        let mut config = CallConfig::for_outgoing(
             call_id,
             &pending.self_lid,
             &pending.peer_lid,
@@ -830,6 +943,7 @@ pub(crate) async fn attach_outgoing_relay(
             relay,
         )
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        config.enable_video = pending.video.is_some();
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
@@ -858,6 +972,8 @@ pub(crate) async fn attach_outgoing_relay(
         &factory,
         pending.source,
         pending.sink,
+        pending.video,
+        pending.video_shared,
         pending.muted,
         pending.ended,
         pending.ev_tx,
@@ -872,6 +988,7 @@ pub(crate) async fn attach_outgoing_relay(
 /// Spawn the call driver over `factory` and register it. Generic over the relay factory so a test
 /// can inject an in-memory transport instead of the real DTLS/SCTP dialer. The session is supplied so
 /// both incoming (`new_incoming`) and outgoing (`new_outgoing`) callers register the right direction.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_call(
     client: &Client,
     call_id: String,
@@ -880,6 +997,7 @@ async fn spawn_call(
     factory: &dyn RelayTransportFactory,
     source: Arc<dyn AudioSource>,
     sink: Arc<dyn AudioSink>,
+    video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
     // Register BEFORE connecting so the entry exists before the driver task can self-clean.
     let registry = client.call_registry();
@@ -896,6 +1014,14 @@ async fn spawn_call(
         move || ended.notify()
     });
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    let video_shared = Arc::new(VideoShared::new());
+    registry.set_video_channels(
+        &call_id,
+        generation,
+        ev_tx.clone(),
+        video_shared.ctl_tx.clone(),
+        video_teardown_hook(&video_shared),
+    );
     attach_engine(
         client,
         &call_id,
@@ -904,6 +1030,8 @@ async fn spawn_call(
         factory,
         source,
         sink,
+        video,
+        video_shared.clone(),
         muted.clone(),
         ended.clone(),
         ev_tx,
@@ -918,7 +1046,9 @@ async fn spawn_call(
         call_creator,
         client_registry: client.call_registry(),
         pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        client: client_weak(client),
         muted,
+        video: video_shared,
         events: ev_rx,
         ended,
     })
@@ -936,6 +1066,8 @@ async fn attach_engine(
     factory: &dyn RelayTransportFactory,
     source: Arc<dyn AudioSource>,
     sink: Arc<dyn AudioSink>,
+    video: Option<VideoEndpoints>,
+    video_shared: Arc<VideoShared>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     ev_tx: async_channel::Sender<CallEvent>,
@@ -999,11 +1131,37 @@ async fn attach_engine(
     // dies with the call instead of parking on `src.recv()` forever, holding the mic channel open.
     let mic_feed = client.runtime.spawn(Box::pin(mute_feed.run()));
 
+    // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
+    // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
+    let (video_in_rx, video_ctl_rx) = video_shared.take_receivers();
+    let (video_out_tx, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
+    // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
+    let sink_slot = video_shared.sink_slot.clone();
+    let video_out_feed = client.runtime.spawn(Box::pin(async move {
+        while let Ok(frame) = video_out_rx.recv().await {
+            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(tx) = tx {
+                // Loss tolerant, like the speaker: a stalled sink sheds frames.
+                let _ = tx.try_send(frame);
+            }
+        }
+    }));
+    if let Some(v) = &video {
+        video_shared.attach_endpoints(client, &v.source, &v.sink, ended.clone());
+        // From-start video: the engine was built with enable_video, but a same-path Enable is
+        // idempotent and keeps one code path for both entries.
+        video_shared.send_control(VideoControl::Enable);
+    }
+
     let channels = CallChannels {
         mic: mic_rx,
         speaker: sink.playout(),
         events: ev_tx,
         rekey: rekey_rx,
+        video_in: video_in_rx,
+        video_out: video_out_tx,
+        video_ctl: video_ctl_rx,
     };
 
     let registry = client.call_registry();
@@ -1017,10 +1175,11 @@ async fn attach_engine(
         e.notify();
     });
     let task = client.runtime.spawn(Box::pin(async move {
-        // Both are captured (moved in), so any teardown -- even an abort before the first poll --
-        // drops them: the mic feed is aborted and `ended` is notified.
+        // All are captured (moved in), so any teardown -- even an abort before the first poll --
+        // drops them: the feeds are aborted and `ended` is notified.
         let _ended_guard = ended_guard;
         let _mic_feed = mic_feed;
+        let _video_out_feed = video_out_feed;
         run_call_tokio(transport, relay_events, channels, engine).await;
         // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
         // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
@@ -1029,6 +1188,157 @@ async fn attach_engine(
     }));
     registry.set_media_task(call_id, generation, task);
     Ok(())
+}
+
+/// Outbound video AU backlog before the source feed back-pressures (AUs are large; keep it short).
+const VIDEO_IN_CHANNEL_CAP: usize = 4;
+/// Inbound video AU backlog between the drive loop and the sink forwarder.
+const VIDEO_OUT_CHANNEL_CAP: usize = 8;
+/// `dec` we advertise on an upgrade request (what we can decode).
+const VIDEO_DEC_REQUEST: &str = "H264";
+/// `dec` WA Web advertises on an UpgradeAccept.
+const VIDEO_DEC_ACCEPT: &str = "H264,AV1";
+
+/// Per-call video plumbing shared between the [`CallHandle`], the registry (signaling handler),
+/// and the drive loop. Created for EVERY call at registration time — idle channels cost nothing,
+/// and a mid-call upgrade must not have to rebuild the media task.
+pub(crate) struct VideoShared {
+    /// Mid-call video-plane control into the drive loop (Enable/Disable/SetOrientation).
+    ctl_tx: VideoControlSender,
+    /// Outbound AUs into the drive loop; a `VideoFeed` pumps the attached source into it.
+    in_tx: async_channel::Sender<Vec<u8>>,
+    /// The CURRENTLY attached sink (swappable: upgrade attaches, downgrade clears). The
+    /// out-forwarder task reads it per frame.
+    sink_slot: Arc<std::sync::Mutex<Option<async_channel::Sender<VideoFrame>>>>,
+    /// The live source feed, aborted on downgrade/replacement.
+    feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
+    /// Receiver halves parked until `attach_engine` hands them to the drive loop.
+    receivers: std::sync::Mutex<Option<VideoReceivers>>,
+}
+
+/// The drive-loop halves of the video channels: (outbound AUs, plane control).
+type VideoReceivers = (async_channel::Receiver<Vec<u8>>, VideoControlReceiver);
+
+impl VideoShared {
+    fn new() -> Self {
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+        Self {
+            ctl_tx,
+            in_tx,
+            sink_slot: Arc::new(std::sync::Mutex::new(None)),
+            feed: std::sync::Mutex::new(None),
+            receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
+        }
+    }
+
+    /// The drive-loop halves. After the one real take (attach_engine), fresh closed channels are
+    /// returned defensively — their arms disable themselves in the driver.
+    fn take_receivers(&self) -> VideoReceivers {
+        self.receivers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_else(|| {
+                let (_ctl_tx, ctl_rx) = video_control_channel();
+                (async_channel::bounded(1).1, ctl_rx)
+            })
+    }
+
+    fn send_control(&self, control: VideoControl) {
+        let _ = self.ctl_tx.send(control);
+    }
+
+    /// Attach (or replace) the consumer's endpoints: the sink becomes the forwarder's target and a
+    /// fresh `VideoFeed` pumps the source; a previous feed is aborted (its source is released).
+    fn attach_endpoints(
+        &self,
+        client: &Client,
+        source: &Arc<dyn VideoSource>,
+        sink: &Arc<dyn VideoSink>,
+        ended: Arc<EndedFlag>,
+    ) {
+        // Queue timing before the feed can make an AU ready. The driver's control arm is biased
+        // ahead of media, so the first RTP timestamp already uses the source's cadence.
+        self.send_control(VideoControl::SetTimestampStride(
+            source.rtp_timestamp_stride(),
+        ));
+        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
+        let feed = VideoFeed {
+            source: source.clone(),
+            src: source.frames(),
+            out: self.in_tx.clone(),
+            ended,
+        };
+        let handle = client.runtime.spawn(Box::pin(feed.run()));
+        if let Some(old) = self
+            .feed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(handle)
+        {
+            old.abort();
+        }
+    }
+
+    /// Release the endpoints (downgrade / refused upgrade): the source feed is aborted, the sink is
+    /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
+    fn detach_endpoints(&self) {
+        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(feed) = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            feed.abort();
+        }
+        self.send_control(VideoControl::Disable);
+    }
+}
+
+/// A registry teardown hook that releases codec endpoints on refusal or call termination.
+fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> {
+    let video = video.clone();
+    Box::new(move || video.detach_endpoints())
+}
+
+/// Forwards encoded AUs from the consumer's source into the drive loop. Bounded on the call's
+/// `ended` flag as well as the channels, so a source that stops producing after the call ends
+/// can't park this task on `recv()` forever.
+struct VideoFeed {
+    source: Arc<dyn VideoSource>,
+    src: async_channel::Receiver<Vec<u8>>,
+    out: async_channel::Sender<Vec<u8>>,
+    ended: Arc<EndedFlag>,
+}
+
+impl VideoFeed {
+    async fn run(self) {
+        use futures::FutureExt;
+        let _source = self.source;
+        loop {
+            let ended = self.ended.wait().fuse();
+            let recv = self.src.recv().fuse();
+            futures::pin_mut!(ended, recv);
+            let au = futures::select_biased! {
+                _ = ended => break,
+                au = recv => match au {
+                    Ok(au) => au,
+                    Err(_) => break,
+                },
+            };
+            // Await the send (the bounded channel back-pressures a source that outruns the wire),
+            // but race it against `ended` too: a dormant call whose 4-AU queue filled before
+            // `attach_engine` drained it would otherwise park here forever past teardown.
+            let ended = self.ended.wait().fuse();
+            let send = self.out.send(au).fuse();
+            futures::pin_mut!(ended, send);
+            futures::select_biased! {
+                _ = ended => break,
+                res = send => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Forwards mic frames to the engine, zeroing them while muted. Zeroing (vs. dropping) keeps the
@@ -1100,7 +1410,10 @@ pub struct CallHandle {
     /// engine task exists yet to fire the drop-guard.
     pending_outgoing_calls:
         Arc<std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>>,
+    /// Weak so a lingering handle can't keep the client alive; upgraded to send `<video>` stanzas.
+    client: std::sync::Weak<Client>,
     muted: Arc<AtomicBool>,
+    video: Arc<VideoShared>,
     events: async_channel::Receiver<CallEvent>,
     ended: Arc<EndedFlag>,
 }
@@ -1135,6 +1448,199 @@ impl CallHandle {
     /// Whether the microphone is currently muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
+    /// and sends `<video state=11 dec="H264" voip_settings="video">`. The peer answers with
+    /// `UpgradeAccept`/`Enabled` (surfaced as [`CallEvent::VideoStateChanged`]); media flows as
+    /// soon as both planes are up. Also the way to start media on a `.video()` call whose builder
+    /// endpoints you skipped.
+    pub async fn start_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.begin_video(
+            Arc::new(source),
+            Arc::new(sink),
+            VideoState::UpgradeRequestV2,
+        )
+        .await
+    }
+
+    /// ACCEPT the peer's video upgrade request (a `VideoStateChanged { state: UpgradeRequestV2 }`
+    /// event): attaches the endpoints, enables the media plane, and answers
+    /// `<video state=4 dec="H264,AV1">` followed by `<video state=1>` (Enabled).
+    pub async fn accept_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.begin_video(Arc::new(source), Arc::new(sink), VideoState::UpgradeAccept)
+            .await
+    }
+
+    /// Send the standalone `<video state=1>` used after a mid-call video upgrade. Captured
+    /// video-from-start callees do not need this extra stanza.
+    pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: None,
+            device_orientation: None,
+        });
+        client.send_node(stanza).await?;
+        Ok(())
+    }
+
+    /// DOWNGRADE to audio: sends `<video state=6>` (Stopped, no marker), tears the local video
+    /// plane down, and releases the source/sink. The audio plane is untouched. Idempotent.
+    pub async fn stop_video(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        // Tear local media down FIRST, matching `Voip::terminate`: the app asked to stop video, so
+        // a failed signaling send must NOT leave the camera streaming. If the peer misses the
+        // Stopped it keeps sending video, but our plane is disabled so those PT-97 packets drop.
+        self.teardown_local_video();
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Stopped,
+            dec: None,
+            device_orientation: Some(0),
+        });
+        client.send_node(stanza).await?;
+        Ok(())
+    }
+
+    /// Release the local video plane: detach the endpoints (stops the camera feed, drops the sink,
+    /// disables the drive-loop plane) and clear the session flag. Shared by `stop_video` and the
+    /// `begin_video` rollback.
+    fn teardown_local_video(&self) {
+        let pending_video = {
+            let mut pending = self
+                .pending_outgoing_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get_mut(&self.call_id)
+                .filter(|entry| entry.generation == self.generation)
+                .and_then(|entry| entry.video.take())
+        };
+        drop(pending_video);
+        if !self
+            .client_registry
+            .run_video_teardown(&self.call_id, self.generation)
+        {
+            self.video.detach_endpoints();
+        }
+        self.client_registry
+            .set_is_video(&self.call_id, self.generation, false);
+    }
+
+    /// Shared upgrade/accept body: attach endpoints, enable the plane, send the handshake stanzas.
+    async fn begin_video(
+        &self,
+        source: Arc<dyn VideoSource>,
+        sink: Arc<dyn VideoSink>,
+        role: VideoState,
+    ) -> Result<(), CallError> {
+        // A stale handle (superseded by a same-call-id glare/retry) must not attach endpoints or
+        // send `<video>` for a call it no longer owns — that would mutate the replacement's state.
+        self.ensure_current()?;
+        if source.rtp_timestamp_stride() == 0 {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
+        let client = self.upgrade_client()?;
+        self.video
+            .attach_endpoints(&client, &source, &sink, self.ended.clone());
+        if !self.client_registry.set_video_teardown(
+            &self.call_id,
+            self.generation,
+            video_teardown_hook(&self.video),
+        ) {
+            self.video.detach_endpoints();
+            return Err(CallError::Media("call no longer active"));
+        }
+        // The upgrade INITIATOR holds outbound video until the peer accepts (the handler ungates on
+        // the peer's UpgradeAccept/Enabled). The acceptor's peer already requested, so it may send
+        // immediately.
+        let ctl = if role == VideoState::UpgradeRequestV2 {
+            VideoControl::EnableAwaitingAccept
+        } else {
+            VideoControl::Enable
+        };
+        self.video.send_control(ctl);
+        self.client_registry
+            .set_is_video(&self.call_id, self.generation, true);
+
+        let peer = self.peer_jid();
+        let send_state = |state: VideoState, dec: Option<&'static str>| {
+            // Each call stanza gets its own wrapper id so the peer's typed ack correlates.
+            let stanza = build_video_state(&VideoStateParams {
+                call_id: &self.call_id,
+                to: &peer,
+                id: &client.generate_request_id(),
+                call_creator: &self.call_creator,
+                state,
+                dec,
+                device_orientation: None,
+            });
+            let client = client.clone();
+            async move { client.send_node(stanza).await }
+        };
+        match role {
+            VideoState::UpgradeRequestV2 => {
+                if let Err(e) =
+                    send_state(VideoState::UpgradeRequestV2, Some(VIDEO_DEC_REQUEST)).await
+                {
+                    self.teardown_local_video();
+                    return Err(e.into());
+                }
+            }
+            _ => {
+                if let Err(e) = send_state(VideoState::UpgradeAccept, Some(VIDEO_DEC_ACCEPT)).await
+                {
+                    self.teardown_local_video();
+                    return Err(e.into());
+                }
+                if let Err(e) = send_state(VideoState::Enabled, None).await {
+                    // The peer times out an incomplete handshake; keep local media aligned with it.
+                    warn!(
+                        "voip: video upgrade handshake failed call_id={} phase=enabled_after_accept error={e}",
+                        self.call_id
+                    );
+                    self.teardown_local_video();
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn upgrade_client(&self) -> Result<Arc<Client>, CallError> {
+        self.client
+            .upgrade()
+            .ok_or(CallError::Media("client dropped"))
+    }
+
+    /// Reject a video op from a handle that no longer owns its call-id (superseded by a same-call-id
+    /// replacement), so it can't drive the replacement's video state.
+    fn ensure_current(&self) -> Result<(), CallError> {
+        if self.client_registry.generation_of(&self.call_id) == Some(self.generation) {
+            Ok(())
+        } else {
+            Err(CallError::Media("call no longer active"))
+        }
     }
 
     /// Tear the call down: abort the media task (which closes the relay and the audio channels).
@@ -1260,7 +1766,9 @@ mod tests {
             call_creator: caller(),
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
         };
@@ -1349,6 +1857,7 @@ mod tests {
             &factory,
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("spawn_call");
@@ -1416,6 +1925,7 @@ mod tests {
             &factory,
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("spawn_call");
@@ -1469,6 +1979,7 @@ mod tests {
             &factory,
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("spawn_call");
@@ -1507,6 +2018,7 @@ mod tests {
             &f1,
             mic1,
             spk1,
+            None,
         )
         .await
         .expect("first spawn_call");
@@ -1520,6 +2032,7 @@ mod tests {
             &f2,
             mic2,
             spk2,
+            None,
         )
         .await
         .expect("replacement spawn_call");
@@ -1567,6 +2080,7 @@ mod tests {
             &f1,
             mic1,
             spk1,
+            None,
         )
         .await
         .expect("first spawn_call");
@@ -1579,6 +2093,7 @@ mod tests {
             &f2,
             mic2,
             spk2,
+            None,
         )
         .await
         .expect("replacement spawn_call");
@@ -1613,6 +2128,7 @@ mod tests {
                 &factory,
                 Arc::new(mic_rx),
                 Arc::new(spk_tx),
+                None,
             )
             .await
             .expect("spawn_call"),
@@ -1698,6 +2214,12 @@ mod tests {
     /// A test client with a real NoiseSocket over a counting transport, so the offer send path
     /// (`send_node`) is exercised, plus the own LID set so `place_call` can derive call_creator.
     async fn make_sending_client() -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
+        make_sending_client_with_failure_after(None).await
+    }
+
+    async fn make_sending_client_with_failure_after(
+        failure_after: Option<usize>,
+    ) -> (Arc<Client>, Arc<std::sync::atomic::AtomicUsize>) {
         use wacore::handshake::NoiseCipher;
         let backend = create_test_backend().await;
         let pm = PersistenceManager::new(backend).await.expect("pm");
@@ -1729,17 +2251,22 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         struct CountingTransport {
             count: Arc<AtomicUsize>,
+            failure_after: Option<usize>,
         }
         #[async_trait]
         impl crate::transport::Transport for CountingTransport {
             async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
-                self.count.fetch_add(1, Ordering::SeqCst);
+                let attempt = self.count.fetch_add(1, Ordering::SeqCst);
+                if self.failure_after.is_some_and(|limit| attempt >= limit) {
+                    return Err(anyhow::anyhow!("injected transport send failure"));
+                }
                 Ok(())
             }
             async fn disconnect(&self) {}
         }
         let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(CountingTransport {
             count: count.clone(),
+            failure_after,
         });
         let key = [0u8; 32];
         let noise_socket = crate::socket::NoiseSocket::new(
@@ -1824,6 +2351,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("place_call");
@@ -1944,6 +2472,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("place_call");
@@ -1997,6 +2526,7 @@ mod tests {
             &[good0.clone(), good1.clone(), bad.clone()],
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await
         .expect("place_call must succeed with surviving devices");
@@ -2069,6 +2599,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await;
         assert!(
@@ -2094,6 +2625,13 @@ mod tests {
     /// Place a dormant outgoing call (offer sent, relay not yet arrived) and return its handle. Shares
     /// the place_call machinery the offer-send test uses; the call lands in pending_outgoing_calls.
     async fn place_dormant_outgoing(client: &Arc<Client>) -> (CallHandle, String) {
+        place_dormant_outgoing_with_video(client, None).await
+    }
+
+    async fn place_dormant_outgoing_with_video(
+        client: &Arc<Client>,
+        video: Option<VideoEndpoints>,
+    ) -> (CallHandle, String) {
         let peer_user = Jid::new("333333333333333", Server::Lid);
         let device = peer_lid();
         seed_peer_session(client, &device).await;
@@ -2111,6 +2649,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            video,
         )
         .await
         .expect("place_call");
@@ -2224,6 +2763,7 @@ mod tests {
                     &factory,
                     Arc::new(mic_rx),
                     Arc::new(spk_tx),
+                    None,
                 )
                 .await
             }
@@ -2289,6 +2829,7 @@ mod tests {
             &factory,
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await;
         assert!(
@@ -2332,7 +2873,9 @@ mod tests {
             call_creator: caller(),
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: std::sync::Weak::new(),
             muted: muted.clone(),
+            video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: ended.clone(),
         };
@@ -2350,6 +2893,8 @@ mod tests {
                     &*factory,
                     Arc::new(mic_rx),
                     Arc::new(spk_tx),
+                    None,
+                    Arc::new(VideoShared::new()),
                     muted,
                     ended,
                     ev_tx,
@@ -2426,6 +2971,8 @@ mod tests {
                     &*factory,
                     Arc::new(mic_rx),
                     Arc::new(spk_tx),
+                    None,
+                    Arc::new(VideoShared::new()),
                     muted,
                     ended,
                     ev_tx,
@@ -2496,6 +3043,8 @@ mod tests {
                     &*factory,
                     Arc::new(mic_rx),
                     Arc::new(spk_tx),
+                    None,
+                    Arc::new(VideoShared::new()),
                     muted,
                     ended,
                     ev_tx,
@@ -2565,6 +3114,7 @@ mod tests {
             &FailingFactory,
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await;
         assert!(
@@ -2638,6 +3188,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await;
         assert!(
@@ -2804,6 +3355,7 @@ mod tests {
             std::slice::from_ref(&device),
             Arc::new(mic_rx),
             Arc::new(spk_tx),
+            None,
         )
         .await;
         assert!(
@@ -2874,5 +3426,403 @@ mod tests {
         // Every device would be pkmsg: nothing to offer without a <device-identity>.
         let err = keep_non_pkmsg_devices(vec![d0, d1], &[true, true]);
         assert!(matches!(err, Err(CallError::MissingDeviceIdentity)));
+    }
+
+    #[test]
+    fn outgoing_video_offer_uses_video_capability() {
+        assert_eq!(offer_capability(false), CAPABILITY_OFFER);
+        assert_eq!(offer_capability(true), CAPABILITY_VIDEO_OFFER);
+        assert_ne!(offer_capability(false), offer_capability(true));
+    }
+
+    /// A live handle over a mock relay + a sending client, for the video handshake tests. The
+    /// returned relay sender is a keepalive: dropping it disconnects the relay and ends the call.
+    async fn sending_handle() -> (
+        Arc<Client>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        CallHandle,
+        async_channel::Sender<wacore::voip::transport::RelayTransportEvent>,
+    ) {
+        let (client, sent_count) = make_sending_client().await;
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let factory = MockFactory {
+            sent: Arc::new(Mutex::new(Vec::new())),
+            relay_rx: Mutex::new(Some(relay_rx)),
+            connects: Arc::new(AtomicUsize::new(0)),
+        };
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let handle = spawn_call(
+            &client,
+            "CID-FACADE".into(),
+            mk_session(),
+            engine(),
+            &factory,
+            Arc::new(mic_rx),
+            Arc::new(spk_tx),
+            None,
+        )
+        .await
+        .expect("spawn_call");
+        (client, sent_count, handle, relay_tx)
+    }
+
+    fn video_endpoints() -> (
+        async_channel::Receiver<Vec<u8>>,
+        async_channel::Sender<VideoFrame>,
+    ) {
+        let (_vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        // Keep the unused halves alive long enough for the test by leaking them into the channels'
+        // refcounts via clone-on-return (the closed-channel behavior is covered elsewhere).
+        std::mem::forget(_vin_tx);
+        std::mem::forget(_vout_rx);
+        (vin_rx, vout_tx)
+    }
+
+    struct TimedVideoSource {
+        frames: async_channel::Receiver<Vec<u8>>,
+        timestamp_stride: u32,
+    }
+
+    impl VideoSource for TimedVideoSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            self.frames.clone()
+        }
+
+        fn rtp_timestamp_stride(&self) -> u32 {
+            self.timestamp_stride
+        }
+    }
+
+    /// The action child of a sent `<call>` node.
+    fn call_action_of(node: &wacore_binary::Node) -> wacore_binary::Node {
+        node.as_node_ref().children().unwrap()[0].to_owned()
+    }
+
+    #[tokio::test]
+    async fn start_video_sends_upgrade_request_with_marker() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("upgrade request must be sent")
+            .expect("waiter");
+        let r = node.as_node_ref();
+        assert!(
+            r.attrs()
+                .optional_string("id")
+                .is_some_and(|id| !id.is_empty()),
+            "the <call> wrapper needs an id so the peer's typed video ack correlates"
+        );
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("11"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings").as_deref(),
+            Some("video"),
+            "the upgrade request must carry the marker attr"
+        );
+        assert!(
+            client
+                .call_registry()
+                .snapshot("CID-FACADE")
+                .expect("session")
+                .is_video,
+            "start_video must mark the session as video"
+        );
+        handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn start_video_rejects_zero_timestamp_stride() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (frames, sink) = video_endpoints();
+        let source = TimedVideoSource {
+            frames,
+            timestamp_stride: 0,
+        };
+
+        assert!(matches!(
+            handle.start_video(source, sink).await,
+            Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero"
+            ))
+        ));
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "invalid timing must not attach endpoints"
+        );
+        handle.hangup().await;
+    }
+
+    // A signaling send failure during an upgrade must roll the local video setup back: endpoints
+    // detached and the session flag cleared, so the source isn't left encoding into a call the peer
+    // never transitioned.
+    #[tokio::test]
+    async fn start_video_send_failure_rolls_back_local_setup() {
+        let client = make_failing_send_client().await; // send_node errors (no noise socket)
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video_shared = Arc::new(VideoShared::new());
+        let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            ev_tx,
+            video_shared.ctl_tx.clone(),
+            video_teardown_hook(&video_shared),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video_shared.clone(),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+        };
+
+        let (vsrc, vsink) = video_endpoints();
+        let res = handle.start_video(vsrc, vsink).await;
+        assert!(res.is_err(), "a failed upgrade send must surface an error");
+        assert!(
+            video_shared.sink_slot.lock().unwrap().is_none(),
+            "the video endpoints must be detached after a failed upgrade"
+        );
+        assert!(
+            !registry.snapshot("CID-FACADE").expect("session").is_video,
+            "a failed upgrade must clear the video flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_video_sends_accept_then_enabled() {
+        let (client, sent_count, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        let before = sent_count.load(Ordering::SeqCst);
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle
+            .accept_video(vsrc, vsink)
+            .await
+            .expect("accept_video");
+        assert_eq!(
+            sent_count.load(Ordering::SeqCst) - before,
+            2,
+            "accept_video sends UpgradeAccept then Enabled"
+        );
+        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("accept must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("4"));
+        assert_eq!(
+            ar.attrs().optional_string("dec").as_deref(),
+            Some("H264,AV1")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "an accept must not carry the upgrade marker"
+        );
+        handle.hangup().await;
+    }
+
+    #[tokio::test]
+    async fn accept_video_enabled_failure_rolls_back_local_plane() {
+        let (client, sent) = make_sending_client_with_failure_after(Some(1)).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+        };
+
+        let (source, sink) = video_endpoints();
+        assert!(handle.accept_video(source, sink).await.is_err());
+        assert_eq!(sent.load(Ordering::SeqCst), 2);
+        assert!(video.sink_slot.lock().unwrap().is_none());
+        assert!(!registry.snapshot("CID-FACADE").unwrap().is_video);
+    }
+
+    #[tokio::test]
+    async fn stop_video_sends_stopped_and_releases_endpoints() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "start_video attaches the sink"
+        );
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.stop_video().await.expect("stop_video");
+        let node = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("downgrade must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("6"));
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "a downgrade must NOT carry the marker (it re-arms the peer's video)"
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "stop_video releases the sink"
+        );
+        assert!(
+            !client
+                .call_registry()
+                .snapshot("CID-FACADE")
+                .expect("session")
+                .is_video,
+            "stop_video must clear the session's video flag"
+        );
+
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .start_video(vsrc, vsink)
+            .await
+            .expect("restart_video");
+        assert!(handle.video.sink_slot.lock().unwrap().is_some());
+        handle.hangup().await;
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "a restarted video plane must rearm terminal teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_stop_video_clears_pending_endpoints() {
+        let (client, _sent) = make_sending_client().await;
+        let (source, sink) = video_endpoints();
+        let (handle, call_id) =
+            place_dormant_outgoing_with_video(&client, Some(VideoEndpoints::new(source, sink)))
+                .await;
+        assert!(
+            client
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .get(&call_id)
+                .is_some_and(|pending| pending.video.is_some())
+        );
+
+        handle.stop_video().await.expect("dormant downgrade");
+        assert!(
+            client
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .get(&call_id)
+                .is_some_and(|pending| pending.video.is_none()),
+            "relay attach must not resurrect endpoints removed before its ack"
+        );
+        assert!(!client.call_registry().snapshot(&call_id).unwrap().is_video);
+        handle.hangup().await;
+    }
+
+    // The VideoFeed pumps the consumer's source into the drive loop's channel and dies on the
+    // call's ended flag (not only on channel closure), so a silent source can't park it forever.
+    #[tokio::test]
+    async fn video_feed_forwards_and_stops_on_ended() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (src_tx, src_rx) = async_channel::unbounded::<Vec<u8>>();
+        let sink: Arc<dyn VideoSink> = {
+            let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+            std::mem::forget(_vout_rx);
+            Arc::new(vout_tx)
+        };
+        let source: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: src_rx,
+            timestamp_stride: 4500,
+        });
+        let ended = Arc::new(EndedFlag::default());
+        shared.attach_endpoints(&client, &source, &sink, ended.clone());
+
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(4500)
+        );
+
+        src_tx.send(vec![1, 2, 3]).await.expect("feed source");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), in_rx.recv())
+            .await
+            .expect("AU must be forwarded")
+            .expect("channel open");
+        assert_eq!(got, vec![1, 2, 3]);
+
+        // Ending the call stops the feed even though the source channel stays open: a later AU
+        // must NOT be forwarded. (The channel itself stays open — VideoShared retains a sender —
+        // so absence of traffic, not closure, is the observable.)
+        ended.notify();
+        tokio::task::yield_now().await;
+        src_tx.send(vec![9, 9, 9]).await.expect("source still open");
+        let after = tokio::time::timeout(std::time::Duration::from_millis(300), in_rx.recv()).await;
+        assert!(
+            after.is_err(),
+            "an AU sent after ended must not be forwarded (feed stopped)"
+        );
+    }
+
+    // A second take is defensive: it must yield closed channels (their driver arms self-disable),
+    // never panic or hand out a duplicate of the live receivers.
+    #[test]
+    fn video_shared_second_take_yields_closed_channels() {
+        let shared = VideoShared::new();
+        let _live = shared.take_receivers();
+        let (in_rx, ctl_rx) = shared.take_receivers();
+        assert!(in_rx.is_closed());
+        assert!(ctl_rx.is_closed());
+    }
+
+    #[test]
+    fn video_control_queue_preserves_state_and_coalesces_orientation() {
+        let shared = VideoShared::new();
+        let (_in_rx, ctl_rx) = shared.take_receivers();
+        shared.send_control(VideoControl::Disable);
+        for orientation in 0..100u8 {
+            shared.send_control(VideoControl::SetOrientation(orientation % 4));
+        }
+        shared.send_control(VideoControl::Enable);
+
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Disable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+        assert_eq!(ctl_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 }
