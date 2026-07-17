@@ -210,11 +210,10 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
-        // Chain mutation done; the batch-safe flush acquires the processing
-        // permit, and a permit holder can need this sender-key lock — release
-        // it first.
+        // Pre-wire persistence can take the processing permit, whose holder may
+        // need this sender-key lock, so release it first.
         drop(_chain_guard);
-        self.client.flush_signal_cache_batch_safe().await?;
+        self.client.persist_signal_state_pre_wire().await?;
 
         Ok((skdm_bytes, ciphertext.into_serialized().into_vec()))
     }
@@ -333,8 +332,10 @@ impl<'a> Signal<'a> {
         )
         .await?;
 
+        // Pre-wire persistence can take the processing permit, whose holder may
+        // need one of these session locks, so release them first.
         drop(_session_guards);
-        self.client.flush_signal_cache_batch_safe().await?;
+        self.client.persist_signal_state_pre_wire().await?;
 
         Ok((result.participant_nodes, result.includes_prekey_message))
     }
@@ -355,5 +356,68 @@ impl Client {
     /// Access low-level Signal protocol operations.
     pub fn signal(&self) -> Signal<'_> {
         Signal::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use wacore::store::{InMemoryBackend, commands::DeviceCommand};
+    use wacore_binary::{Jid, Server};
+
+    use super::*;
+    use crate::runtime_impl::TokioRuntime;
+    use crate::store::persistence_manager::PersistenceManager;
+    use crate::test_utils::MockHttpClient;
+    use crate::transport::mock::MockTransportFactory;
+
+    async fn in_memory_client() -> (Arc<Client>, Arc<InMemoryBackend>) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(backend.clone())
+                .await
+                .expect("initialize persistence manager"),
+        );
+        persistence_manager
+            .process_command(DeviceCommand::SetId(Some(Jid::new(
+                "15550000001",
+                Server::Pn,
+            ))))
+            .await;
+        let (client, _rx) = Client::new(
+            Arc::new(TokioRuntime),
+            persistence_manager,
+            Arc::new(MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+        client.enter_live_mode_for_tests();
+        (client, backend)
+    }
+
+    #[tokio::test]
+    async fn group_encrypt_uses_write_behind_within_a_durable_lease() {
+        let (client, backend) = in_memory_client().await;
+        let group = Jid::new("120363000000000001", Server::Group);
+
+        client
+            .signal()
+            .encrypt_group_message(&group, b"establish sender-key lease")
+            .await
+            .expect("first group encrypt");
+        assert_eq!(
+            backend.sender_key_batch_write_count(),
+            1,
+            "the initial sender-key lease must be durable before ciphertext returns"
+        );
+
+        backend.set_fail_sender_key_writes(true);
+        client
+            .signal()
+            .encrypt_group_message(&group, b"covered by durable sender-key lease")
+            .await
+            .expect("a lease-covered group encrypt must not synchronously flush");
     }
 }

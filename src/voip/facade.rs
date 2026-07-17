@@ -552,9 +552,11 @@ async fn place_call(
         )
         .await
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        // The offer carries these ciphertexts, so a raised lease must be
+        // durable before returning; release session locks before the gate.
         drop(_session_guards);
         client
-            .flush_signal_cache_batch_safe()
+            .persist_signal_state_pre_wire()
             .await
             .map_err(|e| CallError::Setup(e.to_string()))?;
         raw

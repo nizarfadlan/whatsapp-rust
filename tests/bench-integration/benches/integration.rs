@@ -17,9 +17,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use e2e_tests::{TestClient, text_msg};
+use e2e_tests::{TestClient, text_msg, unique_push_name};
 use tokio::sync::Mutex;
 use whatsapp_rust::Jid;
+use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
 
 // Deterministic allocator for CodSpeed's memory instrument: `realloc` always
 // allocates a fresh block and copies, never growing in place. Whether the system
@@ -163,6 +164,106 @@ fn pair_recv() -> &'static Mutex<Pair> {
     PAIR_RECV.get_or_init(|| connect_warmed_pair("bench_recv_a", "bench_recv_b", false))
 }
 
+struct GroupCipherFixture {
+    sender: TestClient,
+    group_jid: Jid,
+}
+
+static GROUP_CIPHER: OnceLock<Mutex<GroupCipherFixture>> = OnceLock::new();
+
+fn group_cipher() -> &'static Mutex<GroupCipherFixture> {
+    GROUP_CIPHER.get_or_init(|| {
+        rt().block_on(async {
+            let sender = TestClient::connect("bench_group_cipher_a")
+                .await
+                .expect("connect group sender");
+            let mut recipient = TestClient::connect("bench_group_cipher_b")
+                .await
+                .expect("connect group recipient");
+            let recipient_jid = recipient.jid().await;
+            let group_jid = sender
+                .client
+                .groups()
+                .create_group(GroupCreateOptions {
+                    subject: "bench signal group cipher".to_string(),
+                    participants: vec![GroupParticipantOptions::new(recipient_jid)],
+                    ..Default::default()
+                })
+                .await
+                .expect("create group");
+            let group_jid = group_jid.metadata.id;
+            let warmup = unique_body("group-cipher-warmup");
+            sender
+                .client
+                .send_message(group_jid.clone(), text_msg(&warmup))
+                .await
+                .expect("seed group sender key");
+            recipient
+                .wait_for_group_text(&group_jid, &warmup, 30)
+                .await
+                .expect("receive group warmup");
+
+            for rx in [sender.event_rx.clone(), recipient.event_rx.clone()] {
+                tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+            }
+
+            Mutex::new(GroupCipherFixture { sender, group_jid })
+        })
+    })
+}
+
+struct ParticipantCipherFixture {
+    sender: TestClient,
+    _device_one: TestClient,
+    _device_two: TestClient,
+    recipient_jid: Jid,
+}
+
+static PARTICIPANT_CIPHER: OnceLock<Mutex<ParticipantCipherFixture>> = OnceLock::new();
+
+fn participant_cipher() -> &'static Mutex<ParticipantCipherFixture> {
+    PARTICIPANT_CIPHER.get_or_init(|| {
+        rt().block_on(async {
+            let sender = TestClient::connect("bench_participant_cipher_a")
+                .await
+                .expect("connect participant sender");
+            let push_name = unique_push_name("bench_participant_cipher_b");
+            let mut device_one = TestClient::connect_as("bench_participant_cipher_b1", &push_name)
+                .await
+                .expect("connect first recipient device");
+            let device_two = TestClient::connect_as("bench_participant_cipher_b2", &push_name)
+                .await
+                .expect("connect second recipient device");
+            let recipient_jid = device_one.jid().await;
+            let warmup = unique_body("participant-cipher-warmup");
+            sender
+                .client
+                .send_message(recipient_jid.clone(), text_msg(&warmup))
+                .await
+                .expect("warm participant sessions");
+            device_one
+                .wait_for_text(&warmup, 30)
+                .await
+                .expect("receive participant warmup");
+
+            for rx in [
+                sender.event_rx.clone(),
+                device_one.event_rx.clone(),
+                device_two.event_rx.clone(),
+            ] {
+                tokio::spawn(async move { while rx.recv().await.is_ok() {} });
+            }
+
+            Mutex::new(ParticipantCipherFixture {
+                sender,
+                _device_one: device_one,
+                _device_two: device_two,
+                recipient_jid,
+            })
+        })
+    })
+}
+
 // x20 coverage: divan's `args` runs the bench once per value and reports each
 // separately, so one fn yields both the single-op result (n=1) and the 20-op
 // batch (n=20) — the loop runs inside the measured region. This preserves the
@@ -215,6 +316,57 @@ fn send_message(bencher: divan::Bencher, n: u64) {
                         .await
                         .expect("send message");
                 }
+            });
+        });
+}
+
+/// Public group encryption after an SKDM and its first sender-key lease are
+/// durable. CodSpeed compares this lease-covered path with the base revision's
+/// unconditional persistence behavior.
+#[divan::bench]
+fn encrypt_group_message_warm(bencher: divan::Bencher) {
+    let rt = rt();
+    let fixture = group_cipher();
+    bencher.bench_local(|| {
+        rt.block_on(async {
+            let guard = fixture.lock().await;
+            std::hint::black_box(
+                guard
+                    .sender
+                    .client
+                    .signal()
+                    .encrypt_group_message(&guard.group_jid, b"benchmark")
+                    .await
+                    .expect("encrypt warmed group message"),
+            );
+        });
+    });
+}
+
+/// Public multi-device participant encryption after its pairwise sessions are
+/// durable. The devices share one phone identity, so this is the same warm
+/// fanout shape used by call-key encryption before it constructs an offer.
+#[divan::bench]
+fn create_participant_nodes_warm_multidevice(bencher: divan::Bencher) {
+    let rt = rt();
+    let fixture = participant_cipher();
+    bencher
+        .with_inputs(|| text_msg("benchmark"))
+        .bench_local_values(|message| {
+            rt.block_on(async {
+                let guard = fixture.lock().await;
+                std::hint::black_box(
+                    guard
+                        .sender
+                        .client
+                        .signal()
+                        .create_participant_nodes(
+                            std::slice::from_ref(&guard.recipient_jid),
+                            &message,
+                        )
+                        .await
+                        .expect("create warmed participant nodes"),
+                );
             });
         });
 }

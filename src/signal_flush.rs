@@ -13,10 +13,9 @@
 //!   a crash inside the window is recoverable. The SEND path coalesces too
 //!   whenever its advance is covered by a durable counter lease (see
 //!   `SessionRecord::reserve_sender_chain_counters` and
-//!   `Client::persist_signal_state_pre_wire`); only a send that raises the
-//!   lease — or advances a group sender-key chain — still flushes
-//!   synchronously before the wire, because reusing an outbound counter would
-//!   reuse its message key + IV.
+//!   `Client::persist_signal_state_pre_wire`); only a send that raises a
+//!   pairwise or sender-key lease still flushes synchronously before the wire,
+//!   because reusing an outbound counter would reuse its message key + IV.
 //! - The offline drain, retry recovery, identity-change recovery and teardown
 //!   keep their own synchronous flushes: those gate acks, receipts or
 //!   follow-up reads on durability and are not routed here.

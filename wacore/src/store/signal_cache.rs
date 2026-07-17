@@ -2288,6 +2288,57 @@ mod lease_reload_tests {
         assert_eq!(plaintext, b"payload");
     }
 
+    /// A sender-key lease requires persistence only when the reservation is
+    /// raised. Covered advances stay dirty for write-behind without blocking a
+    /// ciphertext-producing caller.
+    #[tokio::test]
+    async fn sender_key_leases_only_flush_synchronously_at_reservation_boundaries() {
+        use crate::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
+
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let mut store = CachedSenderKeyStore {
+            cache: &cache,
+            backend: &backend,
+        };
+        let name = sender_key_name();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        create_sender_key_distribution_message(&name, &mut store, &mut rng)
+            .await
+            .expect("sender setup");
+        let first = group_encrypt(&mut store, &name, b"first", &mut rng)
+            .await
+            .expect("first group encrypt");
+        assert_eq!(first.iteration(), 0);
+        assert!(cache.needs_pre_wire_flush().await);
+        cache.flush(&backend).await.expect("first pre-wire flush");
+        assert_eq!(backend.sender_key_batch_write_count(), 1);
+
+        for iteration in 1..SENDER_CHAIN_RESERVATION_BATCH {
+            let message = group_encrypt(&mut store, &name, b"covered", &mut rng)
+                .await
+                .expect("covered group encrypt");
+            assert_eq!(message.iteration(), iteration);
+            assert!(
+                !cache.needs_pre_wire_flush().await,
+                "iteration {iteration} must stay within the durable lease"
+            );
+            assert_eq!(backend.sender_key_batch_write_count(), 1);
+        }
+
+        let boundary = group_encrypt(&mut store, &name, b"boundary", &mut rng)
+            .await
+            .expect("boundary group encrypt");
+        assert_eq!(boundary.iteration(), SENDER_CHAIN_RESERVATION_BATCH);
+        assert!(cache.needs_pre_wire_flush().await);
+        cache
+            .flush(&backend)
+            .await
+            .expect("boundary pre-wire flush");
+        assert_eq!(backend.sender_key_batch_write_count(), 2);
+    }
+
     #[tokio::test]
     async fn clean_sender_key_eviction_does_not_burn_a_lease() {
         let backend = InMemoryBackend::new();
