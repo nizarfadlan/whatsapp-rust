@@ -1048,7 +1048,12 @@ impl VideoPipeline {
     /// the reassembled access unit is returned on the AU's marker packet.
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<Vec<Vec<u8>>> {
         let completed = self.unprotect_video_packet(packet)?.1;
-        (!completed.is_empty()).then_some(completed)
+        (!completed.is_empty()).then_some(
+            completed
+                .into_iter()
+                .map(|(_, access_unit)| access_unit)
+                .collect(),
+        )
     }
 
     pub(crate) fn unprotect_video_packet(
