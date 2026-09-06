@@ -432,6 +432,7 @@ impl H264Depacketizer {
         if marker && !self.au_buf.is_empty() {
             self.drop_partial_fu();
             let completed_timestamp = self.au_timestamp.take().unwrap_or(timestamp);
+            self.last_completed_timestamp = Some(completed_timestamp);
             let au = std::mem::take(&mut self.au_buf);
             self.queue_ready(completed_timestamp, au);
         }
