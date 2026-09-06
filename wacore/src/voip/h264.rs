@@ -528,7 +528,7 @@ mod tests {
         let mut au = None;
         // All packets of one AU share a timestamp.
         for (i, p) in payloads.enumerate() {
-            if let Some(got) = d.push(i as u16, 9000, p, i == last) {
+            if let Some((_, got)) = d.push(i as u16, 9000, p, i == last) {
                 au = Some(got);
             }
         }
@@ -760,7 +760,10 @@ mod tests {
         assert_eq!(d.push(2, 2000, &payloads[2], true), None);
 
         let next = nal(1, 40);
-        assert_eq!(d.push(3, 3000, &next, true), Some(au_from_nals(&[next])));
+        assert_eq!(
+            d.push(3, 3000, &next, true),
+            Some((3000, au_from_nals(&[next])))
+        );
     }
 
     #[test]
@@ -779,7 +782,7 @@ mod tests {
         let got = d
             .push(100, 13000, &tail, true)
             .expect("fresh NAL must flush");
-        assert_eq!(got, au_from_nals(&[tail]));
+        assert_eq!(got, (13000, au_from_nals(&[tail])));
     }
 
     #[test]
@@ -822,17 +825,13 @@ mod tests {
         let flushed = d
             .push(2, 2000, &b1, false)
             .expect("a new timestamp must flush the previous AU whose marker was lost");
-        assert_eq!(
-            flushed,
-            au_from_nals(&[a1]),
-            "the flushed AU is the buffered first frame, not a merge of both"
-        );
+        assert_eq!(flushed, (1000, au_from_nals(&[a1])));
         // AU2 completes normally on its marker.
         let b2 = nal(5, 30);
         let au2 = d
             .push(3, 2000, &b2, true)
             .expect("AU2 completes on its marker");
-        assert_eq!(au2, au_from_nals(&[b1, b2]));
+        assert_eq!(au2, (2000, au_from_nals(&[b1, b2])));
     }
 
     // A reordered packet from an OLDER timestamp must not flush the current AU as complete: it is
@@ -843,7 +842,7 @@ mod tests {
         // AU1 @ ts 1000 completes cleanly.
         let a1 = nal(1, 20);
         let want_a1 = au_from_nals(std::slice::from_ref(&a1));
-        assert_eq!(d.push(0, 1000, &a1, true), Some(want_a1));
+        assert_eq!(d.push(0, 1000, &a1, true), Some((1000, want_a1)));
         // AU2 @ ts 2000 starts (first of two packets, no marker yet).
         let b1 = nal(1, 30);
         assert_eq!(d.push(1, 2000, &b1, false), None);
@@ -859,7 +858,7 @@ mod tests {
         let b2 = nal(5, 25);
         assert_eq!(
             d.push(3, 2000, &b2, true),
-            Some(au_from_nals(&[b1, b2])),
+            Some((2000, au_from_nals(&[b1, b2]))),
             "the in-progress AU survives the reordered packet and completes on its marker"
         );
     }
@@ -870,7 +869,7 @@ mod tests {
         let completed = nal(5, 20);
         assert_eq!(
             d.push(10, 1000, &completed, true),
-            Some(au_from_nals(std::slice::from_ref(&completed)))
+            Some((1000, au_from_nals(std::slice::from_ref(&completed))))
         );
 
         let late = nal(1, 15);
@@ -878,7 +877,7 @@ mod tests {
         let next = nal(1, 25);
         assert_eq!(
             d.push(11, 2000, &next, true),
-            Some(au_from_nals(std::slice::from_ref(&next))),
+            Some((2000, au_from_nals(std::slice::from_ref(&next)))),
             "a late packet from the completed timestamp must not leak into the next AU"
         );
     }
@@ -896,11 +895,11 @@ mod tests {
         let first = d
             .push(1, 2000, &b1, true)
             .expect("boundary flush returns AU1");
-        assert_eq!(first, au_from_nals(&[a1]));
+        assert_eq!(first, (1000, au_from_nals(&[a1])));
         let second = d
             .pop_ready()
             .expect("the second completed AU is ready without another packet");
-        assert_eq!(second, au_from_nals(&[b1]));
+        assert_eq!(second, (2000, au_from_nals(&[b1])));
         assert_eq!(d.pop_ready(), None);
     }
 

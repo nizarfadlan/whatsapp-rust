@@ -1308,7 +1308,8 @@ mod tests {
                 .find_map(|packet| registry.unprotect_video(packet))
                 .expect("participant video packet");
             assert_eq!(decoded.device_jid, *peer);
-            assert_eq!(decoded.access_units, [access_unit.to_vec()]);
+            assert_eq!(decoded.access_units.len(), 1);
+            assert_eq!(decoded.access_units[0].1, access_unit);
         }
     }
 
