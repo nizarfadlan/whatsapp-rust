@@ -3018,6 +3018,8 @@ impl CallEngine {
                         sender: None,
                         device: None,
                         pid: None,
+                        timestamp: header.timestamp,
+                        generation: 0,
                     }));
                 }
             }
@@ -3423,6 +3425,8 @@ impl CallEngine {
                     sender: Some(video.user_jid.clone()),
                     device: Some(video.device_jid.clone()),
                     pid: video.pid,
+                    timestamp: video.header.timestamp,
+                    generation: 0,
                 }));
             }
             return;

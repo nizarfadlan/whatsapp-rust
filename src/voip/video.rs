@@ -7,9 +7,8 @@
 
 pub use wacore::voip::VideoFrame;
 
-/// One captured access unit with its 90 kHz RTP capture timestamp. The driver adds a private
-/// source generation when this crosses the facade boundary, so callers cannot forge generation
-/// ownership while replacing a source.
+/// One captured access unit with its 90 kHz RTP capture timestamp. This is the outbound source
+/// contract; received media uses [`VideoFrame`], which also carries keyframe and RTP metadata.
 #[derive(Debug, Clone)]
 pub struct TimedVideoFrame {
     pub data: Vec<u8>,

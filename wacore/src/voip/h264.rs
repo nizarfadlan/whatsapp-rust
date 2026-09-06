@@ -40,6 +40,10 @@ pub struct VideoFrame {
     pub device: Option<Jid>,
     /// Relay participant id from the authoritative roster.
     pub pid: Option<u32>,
+    /// RTP capture timestamp of the access unit (90 kHz video clock).
+    pub timestamp: u32,
+    /// Call media generation that produced this frame.
+    pub generation: u64,
 }
 
 impl VideoFrame {
@@ -50,8 +54,9 @@ impl VideoFrame {
             keyframe,
             orientation: 0,
             sender: None,
-            device: None,
             pid: None,
+            timestamp: 0,
+            generation: 0,
         }
     }
 }
