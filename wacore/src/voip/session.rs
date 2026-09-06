@@ -1054,7 +1054,7 @@ impl VideoPipeline {
     pub(crate) fn unprotect_video_packet(
         &mut self,
         packet: &[u8],
-    ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
+    ) -> Option<(RtpHeader, Vec<(u32, Vec<u8>)>)> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_streams,

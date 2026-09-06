@@ -54,6 +54,7 @@ impl VideoFrame {
             keyframe,
             orientation: 0,
             sender: None,
+            device: None,
             pid: None,
             timestamp: 0,
             generation: 0,
@@ -300,9 +301,8 @@ pub struct H264Depacketizer {
     au_timestamp: Option<u32>,
     /// Keeps a marker-completed AU closed when one of its packets arrives late.
     last_completed_timestamp: Option<u32>,
-    /// AUs completed this or a prior push but not yet handed back (drained one per
-    /// `push`), so a timestamp boundary coinciding with a marker never drops one.
-    ready: std::collections::VecDeque<Vec<u8>>,
+    /// AUs completed but not yet returned, paired with their RTP timestamps.
+    ready: std::collections::VecDeque<(u32, Vec<u8>)>,
 }
 
 impl H264Depacketizer {
@@ -315,15 +315,15 @@ impl H264Depacketizer {
         self.ready.clear();
     }
 
-    fn queue_ready(&mut self, au: Vec<u8>) {
+    fn queue_ready(&mut self, timestamp: u32, au: Vec<u8>) {
         if self.ready.len() >= H264_MAX_READY_AUS {
             self.ready.pop_front();
         }
-        self.ready.push_back(au);
+        self.ready.push_back((timestamp, au));
     }
 
-    /// Take another AU completed by the previous [`push`](Self::push).
-    pub fn pop_ready(&mut self) -> Option<Vec<u8>> {
+    /// Take another completed AU while preserving its RTP timestamp.
+    pub fn pop_ready(&mut self) -> Option<(u32, Vec<u8>)> {
         self.ready.pop_front()
     }
 
@@ -348,7 +348,7 @@ impl H264Depacketizer {
         timestamp: u32,
         payload: &[u8],
         marker: bool,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(u32, Vec<u8>)> {
         if let Some(cur) = self.au_timestamp {
             if timestamp != cur {
                 // Signed wrap-aware compare (RFC 3550): a FORWARD jump begins a new AU, so flush the
@@ -359,19 +359,19 @@ impl H264Depacketizer {
                     if !self.au_buf.is_empty() {
                         self.drop_partial_fu();
                         let au = std::mem::take(&mut self.au_buf);
-                        self.queue_ready(au);
+                        self.queue_ready(cur, au);
                     }
                     self.last_completed_timestamp = Some(cur);
                     self.au_timestamp = Some(timestamp);
                 } else {
-                    return self.ready.pop_front();
+                    return self.pop_ready();
                 }
             }
         } else {
             if let Some(completed) = self.last_completed_timestamp
                 && (timestamp.wrapping_sub(completed) as i32) <= 0
             {
-                return self.ready.pop_front();
+                return self.pop_ready();
             }
             self.au_timestamp = Some(timestamp);
         }
@@ -429,24 +429,13 @@ impl H264Depacketizer {
             // Type 0 (empty/garbage) and unsupported aggregation types are ignored.
             _ => {}
         }
-        if let Some(au) = self.flush_on(marker) {
-            self.queue_ready(au);
+        if marker && !self.au_buf.is_empty() {
+            self.drop_partial_fu();
+            let completed_timestamp = self.au_timestamp.take().unwrap_or(timestamp);
+            let au = std::mem::take(&mut self.au_buf);
+            self.queue_ready(completed_timestamp, au);
         }
-        // The caller must drain `pop_ready` immediately: a timestamp boundary and marker can finish
-        // two access units in one push.
-        self.ready.pop_front()
-    }
-
-    fn flush_on(&mut self, marker: bool) -> Option<Vec<u8>> {
-        if !marker {
-            return None;
-        }
-        self.drop_partial_fu();
-        self.last_completed_timestamp = self.au_timestamp.take();
-        if self.au_buf.is_empty() {
-            return None;
-        }
-        Some(std::mem::take(&mut self.au_buf))
+        self.pop_ready()
     }
 }
 
