@@ -356,8 +356,10 @@ impl H264Depacketizer {
                 // is a reordered packet from an already-past AU — discard it rather than flush the
                 // current partial as complete, which would corrupt video on normal reordering.
                 if (timestamp.wrapping_sub(cur) as i32) > 0 {
+                    // A timestamp boundary invalidates any partial FU, even when
+                    // no complete NAL has reached the access-unit buffer yet.
+                    self.drop_partial_fu();
                     if !self.au_buf.is_empty() {
-                        self.drop_partial_fu();
                         let au = std::mem::take(&mut self.au_buf);
                         self.queue_ready(cur, au);
                     }
@@ -742,6 +744,23 @@ mod tests {
             out, None,
             "a gapped fragment must not extend the partial NAL"
         );
+    }
+
+    #[test]
+    fn timestamp_change_clears_incomplete_fu_before_middle_fragment() {
+        let au = au_from_nals(&[nal(5, 2500)]);
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au, &mut payloads);
+        assert!(payloads.len() >= 3);
+
+        let mut d = H264Depacketizer::default();
+        assert_eq!(d.push(0, 1000, &payloads[0], false), None);
+        // A middle fragment from a new AU must not inherit the old FU.
+        assert_eq!(d.push(1, 2000, &payloads[1], false), None);
+        assert_eq!(d.push(2, 2000, &payloads[2], true), None);
+
+        let next = nal(1, 40);
+        assert_eq!(d.push(3, 3000, &next, true), Some(au_from_nals(&[next])));
     }
 
     #[test]
