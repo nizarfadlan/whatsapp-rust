@@ -102,7 +102,7 @@ pub struct ParticipantVideo {
     pub device_jid: Jid,
     pub pid: Option<u32>,
     pub header: RtpHeader,
-    pub access_units: Vec<Vec<u8>>,
+    pub access_units: Vec<(u32, Vec<u8>)>,
 }
 
 struct ParticipantReceiver {
