@@ -785,6 +785,9 @@ fn unprotect_srtp_packet(
 /// per media type) and WARP MI tag, but H.264 packetization on top and its own
 /// SSRC/sequencer. One access unit fans out to N RTP packets on send and is
 /// reassembled from them on receive.
+type TimestampedAccessUnit = (u32, Vec<u8>);
+type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
+
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
     recv_keys: E2eSrtpKeys,
@@ -1056,10 +1059,7 @@ impl VideoPipeline {
         )
     }
 
-    pub(crate) fn unprotect_video_packet(
-        &mut self,
-        packet: &[u8],
-    ) -> Option<(RtpHeader, Vec<(u32, Vec<u8>)>)> {
+    pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_streams,
