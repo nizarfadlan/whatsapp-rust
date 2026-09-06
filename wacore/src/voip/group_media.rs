@@ -1309,6 +1309,7 @@ mod tests {
                 .expect("participant video packet");
             assert_eq!(decoded.device_jid, *peer);
             assert_eq!(decoded.access_units.len(), 1);
+            assert_eq!(decoded.access_units[0].0, decoded.header.timestamp);
             assert_eq!(decoded.access_units[0].1, access_unit);
         }
     }

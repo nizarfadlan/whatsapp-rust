@@ -38,7 +38,9 @@ pub trait VideoSource: Send + Sync + 'static {
 }
 
 /// A video sink for a call: reassembled peer access units, with keyframe/orientation metadata.
-/// VoIP is loss tolerant, so the facade drops a frame if the sink can't keep up.
+/// Each frame also carries its 90 kHz RTP timestamp and the authoritative call generation
+/// stamped by the facade, so consumers can fence stale generations after a same-call-id
+/// replacement. VoIP is loss tolerant, so the facade drops a frame if the sink can't keep up.
 pub trait VideoSink: Send + Sync + 'static {
     /// The channel the facade writes received AUs to. Called once when video starts.
     fn playout(&self) -> async_channel::Sender<VideoFrame>;
