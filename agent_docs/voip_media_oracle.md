@@ -130,8 +130,8 @@ No proprietary WASM, captured JS, or personal data belongs in the test commit.
 
 ## Received video orientation proof
 
-`received_frame_rotation_matches_whatsapp_wasm` requires the same captured J
-module and fails if it is unavailable. It calls function 828 at table slot 427
+`received_frame_rotation_matches_whatsapp_wasm` uses the same captured J
+module under the capture-availability policy above. It calls function 828 at table slot 427
 with a synthetic H.264 frame descriptor and records `env::renderVideoFrame_js`.
 The function body hash is
 `6b4c303d8f48d3adc46ef8ba1c3e8dc0aca0db37193974b53101e1a9071b7131`.
@@ -163,6 +163,45 @@ metadata on either end of a fragmented AU, explicit zero versus absence,
 authentication failure, timestamp wrap and reordering, reset, rekey, and SSRC
 replacement. Direct and group engine tests check the signaling fallback.
 Live Android front/rear switching still requires a device retest.
+
+### Incoming extension layout regression
+
+`tools/oracle-core/tests/incoming_orientation_probe.rs` feeds synthetic RTP
+packets to J function 4873 at slot 3954, then passes its parsed extension
+object directly to packet-frame constructor 6003 at slot 4331. The host never
+writes `frame+52`. These probes follow the same capture-availability policy.
+
+The executed profile dispatcher uses functions 4922/4923 and frame-info reader
+4911, then getter 4891. This is distinct from the stream-reader function 4913
+described above. The tests pin function bodies and compare 3,840 packets across
+all metadata bytes, single IDR and FU-A start/end payload shapes, and five
+layouts. Reordered extensions, frame-info alone and the eight-byte form retain
+metadata just as the complete outgoing layout does. The previous Rust parser
+returned `None` for those layouts, incorrectly activating signaling fallback.
+
+Another 285 cases cover element lengths 1 through 16, padding, unknown ID 15,
+duplicate format precedence and truncated elements. The captured getter prefers
+one-byte-format metadata over three-byte-format metadata over extended metadata;
+the last complete element wins within each format. Truncation stops scanning but
+preserves earlier complete metadata. The malformed-input test disables engine
+logging because the isolated parser does not initialize that logger. No host
+imports are called during these comparisons.
+
+Receive orientation now uses `parse_whatsapp_media_frame_info` after packet
+authentication. The exact outgoing extension set, public header structs and
+optional bandwidth/timing fields are unchanged. No missing field is invented.
+
+The separate passthrough test runs eight packet pairs through constructor 6003,
+H.264 passthrough 12236 and renderer 828. It checks Annex-B bytes and JS rotation
+arguments, but not decoded pixels. Its observed OR aggregation across packet
+metadata is not applied to Rust in this fix. Signaling fallback semantics and
+camera-facing corrections are also unchanged. The live Android extension layout
+has not been captured, so this proves a parser discrepancy, not the cause of the
+reported rear-camera image.
+
+```sh
+WA_WASM_DIR=/path/to/captured-wasm cargo test --release -p oracle-core --test incoming_orientation_probe -- --nocapture
+```
 
 ## Camera-control execution boundary
 
