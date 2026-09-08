@@ -512,6 +512,10 @@ pub struct MemoryReport {
     /// finishes. A value that stays high outside a drain means refreshes are
     /// not completing, not that many users were seen.
     pub pending_device_sync: usize,
+    /// Group refreshes in flight or within their connection-scoped cooldown.
+    pub pending_group_device_resync: usize,
+    /// Active group message repairs and short-lived revoke cancellation entries.
+    pub pending_group_message_repairs: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     /// Addresses with a session establishment in flight; normally zero.
@@ -715,6 +719,14 @@ impl MemoryReport {
             ("inbound_commit_batch", self.inbound_commit_batch.entries),
             ("msg_secret_buffer", n(self.msg_secret_buffer)),
             ("pending_device_sync", n(self.pending_device_sync)),
+            (
+                "pending_group_device_resync",
+                n(self.pending_group_device_resync),
+            ),
+            (
+                "pending_group_message_repairs",
+                n(self.pending_group_message_repairs),
+            ),
             ("ensure_inflight", self.ensure_inflight),
             ("group_metadata_inflight", self.group_metadata_inflight),
             ("chat_lane_backlog", self.chat_lane_backlog),
@@ -880,6 +892,16 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  msg_secret_buffer:      {}", self.msg_secret_buffer)?;
         writeln!(f, "  pending_device_sync:    {}", self.pending_device_sync)?;
+        writeln!(
+            f,
+            "  group_device_resync:    {}",
+            self.pending_group_device_resync
+        )?;
+        writeln!(
+            f,
+            "  group_message_repairs:  {}",
+            self.pending_group_message_repairs
+        )?;
         #[cfg(feature = "plugins")]
         {
             writeln!(f, "--- Plugins ---")?;
@@ -1207,6 +1229,7 @@ pub(crate) enum ResponseWaiter {
     Iq(ResponseWaiterSender),
     /// Compare the server's `phash` against ours; act only if they differ.
     Phash(PhashWaiter),
+    GroupPhash(PhashWaiter, crate::send::group_repair::GroupSendSnapshot),
     /// Consume the response on the read loop as it is decoded, so a response
     /// larger than the heap can afford as a tree never becomes one. See
     /// [`Client::execute_streaming`].
@@ -1358,7 +1381,9 @@ impl ResponseWaiterMap {
     pub(crate) fn drop_expired_phash(&mut self) {
         let epoch = self.sweep_epoch;
         self.entries.retain(|_, entry| match &entry.waiter {
-            ResponseWaiter::Phash(waiter) => waiter.registered_epoch >= epoch,
+            ResponseWaiter::Phash(waiter) | ResponseWaiter::GroupPhash(waiter, _) => {
+                waiter.registered_epoch >= epoch
+            }
             ResponseWaiter::Iq(_) | ResponseWaiter::Stream(_) => true,
         });
         self.sweep_epoch = self.sweep_epoch.wrapping_add(1);
@@ -1620,6 +1645,18 @@ pub struct Client {
     pub(crate) sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache,
 
     pub(crate) pending_device_sync: crate::pending_device_sync::PendingDeviceSync,
+    /// Groups with a participant-device resync in flight, so a divergence that
+    /// spans several sends asks the server once instead of once per message.
+    /// Separate from `pending_device_sync`, whose entries are users the offline
+    /// drain resolves with a usync — a group JID there would be queried as if it
+    /// were a contact.
+    pub(crate) pending_group_device_resync: crate::send::group_repair::GroupRepair,
+
+    /// Test-only fault hook: fail the next batched device-list write so a
+    /// regression test can prove destructive cleanup never runs before the
+    /// replacement records are durable. Never set outside tests.
+    #[cfg(test)]
+    pub(crate) fail_next_device_list_write: AtomicBool,
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 

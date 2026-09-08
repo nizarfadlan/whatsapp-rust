@@ -1101,6 +1101,21 @@ pub trait ProtocolStore: Send + Sync {
         payload: &[u8],
     ) -> Result<()>;
 
+    /// Read a sent payload without removing it or refreshing its expiry.
+    /// Cancellation, including detached backend I/O, must leave the row unchanged.
+    /// Backends without this read return an error rather than emulate it with
+    /// take + store, which can lose the payload on cancellation.
+    async fn get_sent_message(
+        &self,
+        _chat_jid: &str,
+        _message_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(crate::store::error::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backend does not support non-consuming sent-message reads",
+        )))
+    }
+
     /// Retrieve and delete a sent message (atomic take). Returns serialized payload.
     /// Called when a retry receipt arrives; consuming prevents double-retry.
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>>;

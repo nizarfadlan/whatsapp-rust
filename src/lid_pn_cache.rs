@@ -62,6 +62,7 @@ pub struct LidPnCache {
     /// mappings plus registry snapshot without a concurrent writer slipping
     /// between those steps.
     mutation: async_lock::Mutex<()>,
+    pub(crate) identity_continuity: wacore::store::signal_cache::IdentityContinuity,
     /// Device-topology tracker (attached by Client construction): a mapping
     /// change alters which canonical record either key resolves to, so adds
     /// record both identifiers. Recording lives here, at the write
@@ -124,11 +125,20 @@ impl LidPnCache {
         config: &CacheEntryConfig,
         store: Option<Arc<dyn wacore::store::CacheStore>>,
     ) -> Self {
+        // Eviction and external writers can change resolution without add().
+        // Historical sends cannot prove alias continuity in those configurations.
+        let identity_continuity =
+            if store.is_none() && config.timeout.is_none() && config.capacity == u64::MAX {
+                wacore::store::signal_cache::IdentityContinuity::default()
+            } else {
+                wacore::store::signal_cache::IdentityContinuity::unavailable()
+            };
         match store {
             Some(s) => Self {
                 lid_to_entry: TypedCache::from_store(s.clone(), NS_LID, config.timeout),
                 pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
                 mutation: async_lock::Mutex::new(()),
+                identity_continuity,
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
                 persisted: TypedCache::from_local(config.build_with_tti()),
@@ -139,6 +149,7 @@ impl LidPnCache {
                 lid_to_entry: TypedCache::from_local(config.build_with_tti()),
                 pn_to_entry: TypedCache::from_local(config.build_with_tti()),
                 mutation: async_lock::Mutex::new(()),
+                identity_continuity,
                 persisted: TypedCache::from_local(config.build_with_tti()),
                 contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
@@ -178,13 +189,14 @@ impl LidPnCache {
         // `Client::memory_report()` `!Send` (unusable off a single thread). The cast
         // is a plain address on every target (`LidPnEntry: Sized` → thin pointer).
         let mut lid_ptrs: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let lid = self
+        let mut lid = self
             .lid_to_entry
             .memory_stats(|_, v| {
                 lid_ptrs.insert(Arc::as_ptr(v) as usize);
                 v.heap_bytes()
             })
             .await;
+        lid.bytes += self.identity_continuity.estimated_heap_bytes() as u64;
         let pn = self
             .pn_to_entry
             .memory_stats(|_, v| {
@@ -304,10 +316,33 @@ impl LidPnCache {
         _guard: &LidPnMutationGuard<'_>,
         record_topology: bool,
     ) {
-        let should_update_pn = match self.pn_to_entry.get(&*entry.phone_number).await {
+        let previous_pn = self.pn_to_entry.get(&*entry.phone_number).await;
+        let should_update_pn = match &previous_pn {
             Some(existing) => existing.created_at <= entry.created_at,
             None => true,
         };
+        let previous_lid = self.lid_to_entry.get(&*entry.lid).await;
+        let mapping_changed = previous_lid
+            .as_ref()
+            .is_none_or(|existing| existing.phone_number != entry.phone_number)
+            || (should_update_pn
+                && previous_pn
+                    .as_ref()
+                    .is_none_or(|existing| existing.lid != entry.lid));
+        let _identity_change = mapping_changed.then(|| {
+            self.identity_continuity.changing(
+                [
+                    Some(&*entry.lid),
+                    Some(&*entry.phone_number),
+                    previous_pn.as_ref().map(|previous| &*previous.lid),
+                    previous_lid
+                        .as_ref()
+                        .map(|previous| &*previous.phone_number),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+        });
 
         // One shared copy of the entry; the keys clone the entry's own
         // Arc<str> allocations, so each identifier lives once per mapping.
@@ -415,6 +450,7 @@ impl LidPnCache {
     /// `invalidate_all` which is fire-and-forget).
     pub async fn clear(&self) {
         let _guard = self.lock_mutation().await;
+        let _identity_change = self.identity_continuity.changing([]);
         self.lid_to_entry.clear().await;
         self.pn_to_entry.clear().await;
         self.persisted.clear().await;
@@ -440,6 +476,44 @@ impl LidPnCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evictable_alias_cache_cannot_authorize_historical_sends() {
+        for config in [
+            CacheEntryConfig::new(None, 1),
+            CacheEntryConfig::new(Some(std::time::Duration::from_secs(60)), u64::MAX),
+        ] {
+            let cache = LidPnCache::with_config(&config, None);
+            assert_eq!(cache.identity_continuity.snapshot(), None);
+        }
+        assert!(LidPnCache::new().identity_continuity.snapshot().is_some());
+    }
+
+    #[tokio::test]
+    async fn alias_journal_records_both_ends_of_replaced_mappings() {
+        let cache = LidPnCache::new();
+        let original = LidPnEntry::new("100000000000001", "15550000001", LearningSource::Usync);
+        cache.add(&original).await;
+        let sent = cache.identity_continuity.snapshot();
+        let mut replacement = original.clone();
+        replacement.lid = "100000000000002".into();
+        cache.add(&replacement).await;
+        replacement.phone_number = "15550000002".into();
+        cache.add(&replacement).await;
+        for user in [
+            "100000000000001",
+            "100000000000002",
+            "15550000001",
+            "15550000002",
+        ] {
+            assert!(!cache.identity_continuity.unchanged_for(sent, [user]));
+        }
+        assert!(
+            cache
+                .identity_continuity
+                .unchanged_for(sent, ["15550000003"])
+        );
+    }
 
     #[tokio::test]
     async fn test_basic_operations() {

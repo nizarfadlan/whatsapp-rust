@@ -3710,6 +3710,26 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
+    async fn get_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        let chat_jid = chat_jid.to_string();
+        let message_id = message_id.to_string();
+        let device_id = self.device_id;
+        self.with_read_retry("get_sent_message", || {
+            let chat_jid = chat_jid.clone();
+            let message_id = message_id.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                sent_messages::table
+                    .select(sent_messages::payload)
+                    .filter(sent_messages::chat_jid.eq(&chat_jid))
+                    .filter(sent_messages::message_id.eq(&message_id))
+                    .filter(sent_messages::device_id.eq(device_id))
+                    .first(conn)
+                    .optional()
+            })
+        })
+        .await
+    }
+
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
         let chat_jid = chat_jid.to_string();
         let message_id = message_id.to_string();
@@ -4350,6 +4370,66 @@ mod tests {
         SqliteStore::new(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    #[tokio::test]
+    async fn get_sent_message_preserves_payload_expiry_and_device_scope() {
+        let store = create_test_store().await;
+        let chat = "120363000000000001@g.us";
+        store
+            .store_sent_message(chat, "READ", b"payload")
+            .await
+            .unwrap();
+        store
+            .write_blocking(|conn| {
+                diesel::update(sent_messages::table)
+                    .set(sent_messages::created_at.eq(1_i64))
+                    .execute(conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .get_sent_message(chat, "READ")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"payload".as_slice())
+            );
+        }
+        assert!(
+            store
+                .get_sent_message(chat, "MISSING")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_sent_message("120363000000000002@g.us", "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .share_for_device(store.device_id + 1)
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.delete_expired_sent_messages(2).await.unwrap(), 1);
+        assert!(
+            store
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The legacy-spelling normalisation, run against the migration file itself
@@ -7417,6 +7497,11 @@ mod read_routing_tests {
     /// Anything else matching a read-shaped name has to route through
     /// `read_query` or this test fails.
     const ON_THE_WRITE_QUEUE: &[(&str, &str)] = &[
+        (
+            "get_sent_message",
+            "retries SQLITE_BUSY on the write queue: a read error skips the repair, \
+             so retain the consuming lookup's retry behavior without deleting the row",
+        ),
         (
             "get_pending_inbound",
             "retries SQLITE_BUSY on the write queue: a read error here fails closed \

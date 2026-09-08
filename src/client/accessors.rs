@@ -426,6 +426,9 @@ impl Client {
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
         let msg_secret_buffer = self.msg_secret_buffer.pending_len();
         let pending_device_sync = self.pending_device_sync.len();
+        let pending_group_device_resync = self.pending_group_device_resync.len();
+        let pending_group_message_repairs =
+            self.pending_group_device_resync.retained_message_count();
         let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
@@ -498,6 +501,8 @@ impl Client {
             offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,
+            pending_group_device_resync,
+            pending_group_message_repairs,
             session_locks: self.session_locks.entry_count_async().await,
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
